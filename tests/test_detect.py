@@ -1515,3 +1515,106 @@ def test_convert_office_file_does_not_rewrite_existing_sidecar(tmp_path, monkeyp
     second = detect_mod.convert_office_file(src, out_dir)
     assert second == first
     assert second.stat().st_mtime_ns == mtime_before
+
+
+def _minimal_ipynb(cells):
+    import json
+    return json.dumps({"cells": cells, "nbformat": 4, "nbformat_minor": 5})
+
+
+def test_classify_ipynb():
+    assert classify_file(Path("analysis.ipynb")) == FileType.DOCUMENT
+
+
+def test_ipynb_to_markdown_mixed_cells(tmp_path):
+    nb_path = tmp_path / "nb.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb([
+            {"cell_type": "markdown", "source": "# Title\n\nIntro text."},
+            {
+                "cell_type": "code",
+                "source": "import pandas as pd\nprint('hi')",
+                "outputs": [{"output_type": "stream", "text": "hi\n"}],
+            },
+            {"cell_type": "markdown", "source": "## Section"},
+        ]),
+        encoding="utf-8",
+    )
+    md = detect_mod.ipynb_to_markdown(nb_path)
+    assert "# Title" in md
+    assert "```python\nimport pandas as pd" in md
+    assert "hi\n" not in md  # outputs stripped
+    assert "## Section" in md
+    assert md.index("# Title") < md.index("```python") < md.index("## Section")
+
+
+def test_ipynb_to_markdown_empty_notebook(tmp_path):
+    nb_path = tmp_path / "empty.ipynb"
+    nb_path.write_text(_minimal_ipynb([]), encoding="utf-8")
+    assert detect_mod.ipynb_to_markdown(nb_path) == ""
+
+
+def test_ipynb_to_markdown_malformed_json(tmp_path):
+    nb_path = tmp_path / "bad.ipynb"
+    nb_path.write_text("{not valid json", encoding="utf-8")
+    assert detect_mod.ipynb_to_markdown(nb_path) == ""
+
+
+def test_detect_converts_notebook_to_sidecar(tmp_path):
+    nb_path = tmp_path / "analysis.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb([
+            {"cell_type": "markdown", "source": "# Analysis"},
+            {"cell_type": "code", "source": "x = 1"},
+        ]),
+        encoding="utf-8",
+    )
+    result = detect(tmp_path)
+    assert len(result["files"]["document"]) == 1
+    sidecar = Path(result["files"]["document"][0])
+    assert sidecar.suffix == ".md"
+    assert sidecar.exists()
+    text = sidecar.read_text(encoding="utf-8")
+    assert "converted from analysis.ipynb" in text
+    assert "# Analysis" in text
+    assert "x = 1" in text
+    assert result["total_words"] > 0
+
+
+def test_convert_notebook_file_empty_notebook_no_sidecar(tmp_path):
+    nb_path = tmp_path / "empty.ipynb"
+    nb_path.write_text(_minimal_ipynb([]), encoding="utf-8")
+    out_dir = tmp_path / "converted"
+    assert detect_mod.convert_notebook_file(nb_path, out_dir) is None
+    assert not list(out_dir.glob("*.md"))
+
+
+def test_detect_incremental_notebook_sidecar_tracks_changes(tmp_path):
+    """When a notebook is edited, re-converting after removing the stale sidecar
+    produces updated content that detect_incremental picks up as changed."""
+    nb_path = tmp_path / "analysis.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb([{"cell_type": "markdown", "source": "v1"}]),
+        encoding="utf-8",
+    )
+    first = detect(tmp_path)
+    sidecar = Path(first["files"]["document"][0])
+    manifest_path = tmp_path / "graphify-out" / "manifest.json"
+    save_manifest(
+        {sidecar: {"mtime": sidecar.stat().st_mtime, "ast_hash": "x", "semantic_hash": "y"}},
+        str(manifest_path),
+        root=tmp_path,
+    )
+
+    nb_path.write_text(
+        _minimal_ipynb([{"cell_type": "markdown", "source": "v2 updated"}]),
+        encoding="utf-8",
+    )
+    sidecar.unlink()
+    converted_dir = tmp_path / "graphify-out" / "converted"
+    new_sidecar = detect_mod.convert_notebook_file(nb_path, converted_dir)
+    assert new_sidecar is not None
+    assert "v2 updated" in new_sidecar.read_text(encoding="utf-8")
+
+    inc = detect_incremental(tmp_path, manifest_path=str(manifest_path))
+    assert any(str(new_sidecar) == f for f in inc["new_files"]["document"])

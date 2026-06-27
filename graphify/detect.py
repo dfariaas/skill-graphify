@@ -32,6 +32,9 @@ DOC_EXTENSIONS = {'.md', '.mdx', '.qmd', '.txt', '.rst', '.html', '.yaml', '.yml
 PAPER_EXTENSIONS = {'.pdf'}
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg'}
 OFFICE_EXTENSIONS = {'.docx', '.xlsx'}
+# Notebooks are converted to markdown sidecars before indexing — do NOT add .ipynb
+# to CODE_EXTENSIONS or DOC_EXTENSIONS.
+NOTEBOOK_EXTENSIONS = {'.ipynb'}
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.mp3', '.wav', '.m4a', '.ogg'}
 
 CORPUS_WARN_THRESHOLD = 50_000    # words - below this, warn "you may not need a graph"
@@ -413,6 +416,8 @@ def classify_file(path: Path) -> FileType | None:
         return FileType.DOCUMENT
     if ext in OFFICE_EXTENSIONS:
         return FileType.DOCUMENT
+    if ext in NOTEBOOK_EXTENSIONS:
+        return FileType.DOCUMENT
     if ext in GOOGLE_WORKSPACE_EXTENSIONS:
         return FileType.DOCUMENT
     if ext in VIDEO_EXTENSIONS:
@@ -601,20 +606,29 @@ def xlsx_extract_structure(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def convert_office_file(path: Path, out_dir: Path) -> Path | None:
-    """Convert a .docx or .xlsx to a markdown sidecar in out_dir.
+def ipynb_to_markdown(path: Path) -> str:
+    """Convert a Jupyter notebook to markdown, stripping outputs."""
+    if not _file_within_size_cap(path):
+        return ""
+    try:
+        nb = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        lines = []
+        for cell in nb.get("cells", []):
+            ct = cell.get("cell_type")
+            src = "".join(cell.get("source", []))
+            if not src.strip():
+                continue
+            if ct == "markdown":
+                lines.append(src)
+            elif ct == "code":
+                lines.append(f"```python\n{src}\n```")
+        return "\n\n".join(lines)
+    except Exception:
+        return ""
 
-    Returns the path of the converted .md file, or None if conversion failed
-    or the required library is not installed.
-    """
-    ext = path.suffix.lower()
-    if ext == ".docx":
-        text = docx_to_markdown(path)
-    elif ext == ".xlsx":
-        text = xlsx_to_markdown(path)
-    else:
-        return None
 
+def _write_markdown_sidecar(path: Path, out_dir: Path, text: str) -> Path | None:
+    """Write a markdown sidecar for a converted source file."""
     if not text.strip():
         return None
 
@@ -640,6 +654,30 @@ def convert_office_file(path: Path, out_dir: Path) -> Path | None:
         encoding="utf-8",
     )
     return out_path
+
+
+def convert_office_file(path: Path, out_dir: Path) -> Path | None:
+    """Convert a .docx or .xlsx to a markdown sidecar in out_dir.
+
+    Returns the path of the converted .md file, or None if conversion failed
+    or the required library is not installed.
+    """
+    ext = path.suffix.lower()
+    if ext == ".docx":
+        text = docx_to_markdown(path)
+    elif ext == ".xlsx":
+        text = xlsx_to_markdown(path)
+    else:
+        return None
+
+    return _write_markdown_sidecar(path, out_dir, text)
+
+
+def convert_notebook_file(path: Path, out_dir: Path) -> Path | None:
+    """Convert a .ipynb to a markdown sidecar in out_dir."""
+    if path.suffix.lower() not in NOTEBOOK_EXTENSIONS:
+        return None
+    return _write_markdown_sidecar(path, out_dir, ipynb_to_markdown(path))
 
 
 def count_words(path: Path) -> int:
@@ -1130,6 +1168,16 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                 else:
                     # Conversion failed (library not installed) - skip with note
                     skipped_sensitive.append(str(p) + " [office conversion failed - pip install graphifyy[office]]")
+                continue
+            if p.suffix.lower() in NOTEBOOK_EXTENSIONS:
+                md_path = convert_notebook_file(p, converted_dir)
+                if md_path:
+                    if _is_ignored(md_path, root, ignore_patterns, _cache=ignore_cache):
+                        continue
+                    files[ftype].append(str(md_path))
+                    total_words += count_words(md_path)
+                else:
+                    skipped_sensitive.append(str(p) + " [notebook conversion failed]")
                 continue
             files[ftype].append(str(p))
             if ftype != FileType.VIDEO:
