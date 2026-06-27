@@ -671,7 +671,9 @@ def ipynb_to_markdown(path: Path) -> str:
 def convert_notebook_file(path: Path, out_dir: Path) -> Path | None:
     """Convert a .ipynb to a markdown sidecar in out_dir.
 
-    Mirrors convert_office_file(): same sidecar naming and mtime semantics.
+    Mirrors convert_office_file() sidecar naming. Unlike office files, an
+    existing sidecar is refreshed when cell sources change but left untouched
+    when only outputs/metadata changed — notebook re-runs must not re-extract.
     """
     if path.suffix.lower() not in NOTEBOOK_EXTENSIONS:
         return None
@@ -686,12 +688,10 @@ def convert_notebook_file(path: Path, out_dir: Path) -> Path | None:
     normalized_path = unicodedata.normalize("NFC", str(path.resolve()))
     name_hash = hashlib.sha256(normalized_path.encode()).hexdigest()[:8]
     out_path = out_dir / f"{path.stem}_{name_hash}.md"
-    if out_path.exists():
+    payload = f"<!-- converted from {path.name} -->\n\n{text}"
+    if out_path.exists() and out_path.read_text(encoding="utf-8") == payload:
         return out_path
-    out_path.write_text(
-        f"<!-- converted from {path.name} -->\n\n{text}",
-        encoding="utf-8",
-    )
+    out_path.write_text(payload, encoding="utf-8")
     return out_path
 
 

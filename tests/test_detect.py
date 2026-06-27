@@ -1589,32 +1589,110 @@ def test_convert_notebook_file_empty_notebook_no_sidecar(tmp_path):
     assert not list(out_dir.glob("*.md"))
 
 
-def test_detect_incremental_notebook_sidecar_tracks_changes(tmp_path):
-    """When a notebook is edited, re-converting after removing the stale sidecar
-    produces updated content that detect_incremental picks up as changed."""
+def test_convert_notebook_file_output_change_preserves_sidecar_mtime(tmp_path):
+    """Re-running a notebook updates outputs in the .ipynb but not the sidecar."""
+    nb_path = tmp_path / "analysis.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb([
+            {"cell_type": "code", "source": "print(1)", "outputs": []},
+        ]),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "converted"
+    sidecar = detect_mod.convert_notebook_file(nb_path, out_dir)
+    assert sidecar is not None
+    mtime_before = sidecar.stat().st_mtime_ns
+
+    nb_path.write_text(
+        _minimal_ipynb([
+            {
+                "cell_type": "code",
+                "source": "print(1)",
+                "outputs": [{"output_type": "stream", "text": "1\n"}],
+                "execution_count": 1,
+            },
+        ]),
+        encoding="utf-8",
+    )
+    again = detect_mod.convert_notebook_file(nb_path, out_dir)
+    assert again == sidecar
+    assert again.stat().st_mtime_ns == mtime_before
+
+
+def test_convert_notebook_file_source_change_rewrites_sidecar(tmp_path):
+    nb_path = tmp_path / "analysis.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb([{"cell_type": "code", "source": "x = 1", "outputs": []}]),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "converted"
+    sidecar = detect_mod.convert_notebook_file(nb_path, out_dir)
+    mtime_before = sidecar.stat().st_mtime_ns
+
+    nb_path.write_text(
+        _minimal_ipynb([{"cell_type": "code", "source": "x = 2", "outputs": []}]),
+        encoding="utf-8",
+    )
+    updated = detect_mod.convert_notebook_file(nb_path, out_dir)
+    assert updated == sidecar
+    assert "x = 2" in updated.read_text(encoding="utf-8")
+    assert updated.stat().st_mtime_ns >= mtime_before
+
+
+def test_detect_refreshes_notebook_sidecar_on_source_change(tmp_path):
+    """Cell source edits must update the sidecar so a later extract sees new content."""
     nb_path = tmp_path / "analysis.ipynb"
     nb_path.write_text(
         _minimal_ipynb([{"cell_type": "markdown", "source": "v1"}]),
         encoding="utf-8",
     )
-    first = detect(tmp_path)
-    sidecar = Path(first["files"]["document"][0])
-    manifest_path = tmp_path / "graphify-out" / "manifest.json"
-    save_manifest(
-        {sidecar: {"mtime": sidecar.stat().st_mtime, "ast_hash": "x", "semantic_hash": "y"}},
-        str(manifest_path),
-        root=tmp_path,
-    )
+    detect(tmp_path)
+    converted_dir = tmp_path / "graphify-out" / "converted"
+    sidecar = next(converted_dir.glob("analysis_*.md"))
 
     nb_path.write_text(
         _minimal_ipynb([{"cell_type": "markdown", "source": "v2 updated"}]),
         encoding="utf-8",
     )
-    sidecar.unlink()
-    converted_dir = tmp_path / "graphify-out" / "converted"
-    new_sidecar = detect_mod.convert_notebook_file(nb_path, converted_dir)
-    assert new_sidecar is not None
-    assert "v2 updated" in new_sidecar.read_text(encoding="utf-8")
+    detect(tmp_path)
+    assert "v2 updated" in sidecar.read_text(encoding="utf-8")
 
+
+def test_detect_incremental_ignores_notebook_output_only_changes(tmp_path):
+    import json
+
+    nb_path = tmp_path / "analysis.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb([{"cell_type": "code", "source": "print(1)", "outputs": []}]),
+        encoding="utf-8",
+    )
+    first = detect(tmp_path)
+    sidecar = Path(first["files"]["document"][0])
+    mtime_before = sidecar.stat().st_mtime_ns
+    manifest_path = tmp_path / "graphify-out" / "manifest.json"
+    Path(manifest_path).write_text(
+        json.dumps({
+            str(sidecar): {
+                "mtime": sidecar.stat().st_mtime,
+                "ast_hash": "a" * 32,
+                "semantic_hash": "b" * 32,
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    nb_path.write_text(
+        _minimal_ipynb([
+            {
+                "cell_type": "code",
+                "source": "print(1)",
+                "outputs": [{"output_type": "stream", "text": "1\n"}],
+                "execution_count": 1,
+            },
+        ]),
+        encoding="utf-8",
+    )
     inc = detect_incremental(tmp_path, manifest_path=str(manifest_path))
-    assert any(str(new_sidecar) == f for f in inc["new_files"]["document"])
+    assert sidecar.stat().st_mtime_ns == mtime_before
+    assert not inc["new_files"]["document"]
+    assert str(sidecar) in inc["unchanged_files"]["document"]
