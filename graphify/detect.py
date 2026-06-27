@@ -606,29 +606,20 @@ def xlsx_extract_structure(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-def ipynb_to_markdown(path: Path) -> str:
-    """Convert a Jupyter notebook to markdown, stripping outputs."""
-    if not _file_within_size_cap(path):
-        return ""
-    try:
-        nb = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
-        lines = []
-        for cell in nb.get("cells", []):
-            ct = cell.get("cell_type")
-            src = "".join(cell.get("source", []))
-            if not src.strip():
-                continue
-            if ct == "markdown":
-                lines.append(src)
-            elif ct == "code":
-                lines.append(f"```python\n{src}\n```")
-        return "\n\n".join(lines)
-    except Exception:
-        return ""
+def convert_office_file(path: Path, out_dir: Path) -> Path | None:
+    """Convert a .docx or .xlsx to a markdown sidecar in out_dir.
 
+    Returns the path of the converted .md file, or None if conversion failed
+    or the required library is not installed.
+    """
+    ext = path.suffix.lower()
+    if ext == ".docx":
+        text = docx_to_markdown(path)
+    elif ext == ".xlsx":
+        text = xlsx_to_markdown(path)
+    else:
+        return None
 
-def _write_markdown_sidecar(path: Path, out_dir: Path, text: str) -> Path | None:
-    """Write a markdown sidecar for a converted source file."""
     if not text.strip():
         return None
 
@@ -656,28 +647,52 @@ def _write_markdown_sidecar(path: Path, out_dir: Path, text: str) -> Path | None
     return out_path
 
 
-def convert_office_file(path: Path, out_dir: Path) -> Path | None:
-    """Convert a .docx or .xlsx to a markdown sidecar in out_dir.
-
-    Returns the path of the converted .md file, or None if conversion failed
-    or the required library is not installed.
-    """
-    ext = path.suffix.lower()
-    if ext == ".docx":
-        text = docx_to_markdown(path)
-    elif ext == ".xlsx":
-        text = xlsx_to_markdown(path)
-    else:
-        return None
-
-    return _write_markdown_sidecar(path, out_dir, text)
+def ipynb_to_markdown(path: Path) -> str:
+    """Convert a Jupyter notebook to markdown, stripping outputs."""
+    if not _file_within_size_cap(path):
+        return ""
+    try:
+        nb = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        lines = []
+        for cell in nb.get("cells", []):
+            ct = cell.get("cell_type")
+            src = "".join(cell.get("source", []))
+            if not src.strip():
+                continue
+            if ct == "markdown":
+                lines.append(src)
+            elif ct == "code":
+                lines.append(f"```python\n{src}\n```")
+        return "\n\n".join(lines)
+    except Exception:
+        return ""
 
 
 def convert_notebook_file(path: Path, out_dir: Path) -> Path | None:
-    """Convert a .ipynb to a markdown sidecar in out_dir."""
+    """Convert a .ipynb to a markdown sidecar in out_dir.
+
+    Mirrors convert_office_file(): same sidecar naming and mtime semantics.
+    """
     if path.suffix.lower() not in NOTEBOOK_EXTENSIONS:
         return None
-    return _write_markdown_sidecar(path, out_dir, ipynb_to_markdown(path))
+
+    text = ipynb_to_markdown(path)
+    if not text.strip():
+        return None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    import hashlib
+    import unicodedata
+    normalized_path = unicodedata.normalize("NFC", str(path.resolve()))
+    name_hash = hashlib.sha256(normalized_path.encode()).hexdigest()[:8]
+    out_path = out_dir / f"{path.stem}_{name_hash}.md"
+    if out_path.exists():
+        return out_path
+    out_path.write_text(
+        f"<!-- converted from {path.name} -->\n\n{text}",
+        encoding="utf-8",
+    )
+    return out_path
 
 
 def count_words(path: Path) -> int:
