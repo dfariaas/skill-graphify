@@ -662,7 +662,7 @@ def ipynb_to_markdown(path: Path) -> str:
             if ct == "markdown":
                 lines.append(src)
             elif ct == "code":
-                lines.append(f"```python\n{src}\n```")
+                lines.append(f"```code\n{src}\n```")
         return "\n\n".join(lines)
     except Exception:
         return ""
