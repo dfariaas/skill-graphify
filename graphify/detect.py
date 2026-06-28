@@ -648,26 +648,40 @@ def convert_office_file(path: Path, out_dir: Path) -> Path | None:
 
 
 def ipynb_to_markdown(path: Path) -> str:
-    """Convert a Jupyter notebook to markdown, stripping outputs."""
+    """Convert a Jupyter notebook to markdown, stripping outputs.
+
+    Uses the notebook's kernel language from metadata for fenced code blocks,
+    falling back to ``code`` when the metadata is absent.
+    """
     if not _file_within_size_cap(path):
         return ""
     try:
         nb = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        # Resolve the kernel language from notebook metadata so fenced code
+        # blocks use the correct language identifier (e.g. ```python) rather
+        # than the generic ```code fallback.
+        meta = nb.get("metadata", {})
+        lang = (
+            meta.get("language_info", {}).get("name")
+            or meta.get("kernelspec", {}).get("language")
+            or "code"
+        )
         lines = []
         for cell in nb.get("cells", []):
             ct = cell.get("cell_type")
-            src = "".join(cell.get("source", []))
+            raw_src = cell.get("source", [])
+            src = raw_src if isinstance(raw_src, str) else "".join(raw_src)
             if not src.strip():
                 continue
             if ct == "markdown":
                 lines.append(src)
             elif ct == "code":
-                lines.append(f"```code\n{src}\n```")
+                lines.append(f"```{lang}\n{src}\n```")
         return "\n\n".join(lines)
     except Exception:
         return ""
 
-
+    
 def convert_notebook_file(path: Path, out_dir: Path) -> Path | None:
     """Convert a .ipynb to a markdown sidecar in out_dir.
 
