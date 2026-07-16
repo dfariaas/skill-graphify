@@ -2678,6 +2678,651 @@ def _resolve_java_member_calls(
             })
 
 
+def _resolve_kotlin_member_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Kotlin member calls through method-scoped receiver type facts.
+
+    Kotlin member calls are withheld from bare-name matching because a common
+    method name can belong to many unrelated classes. Resolution succeeds only
+    for one real JVM type definition and one method owned by that type.
+    """
+
+    def key(label: str) -> str:
+        return str(label).strip().removeprefix(".").removesuffix("()")
+
+    contained = {
+        edge.get("target") for edge in all_edges if edge.get("relation") == "contains"
+    }
+    node_by_id = {node.get("id"): node for node in all_nodes}
+
+    kotlin_scope_by_file: dict[str, dict] = {}
+    for result in per_file:
+        scope = result.get("kotlin_scope")
+        if not scope:
+            continue
+        source_file = next(
+            (
+                str(node.get("source_file"))
+                for node in result.get("nodes", [])
+                if str(node.get("source_file") or "")
+                .lower()
+                .endswith((".kt", ".kts"))
+            ),
+            None,
+        )
+        if source_file:
+            kotlin_scope_by_file[source_file] = scope
+
+    type_def_nids: dict[str, list[str]] = {}
+    type_def_nids_by_fqn: dict[str, list[str]] = {}
+    type_fqn_by_nid: dict[str, str] = {}
+    for node in all_nodes:
+        if (
+            node.get("source_file")
+            and _lang_family(node.get("source_file")) == "jvm"
+            and node.get("id") in contained
+            and _is_type_like_definition(node)
+        ):
+            type_name = key(node.get("label", ""))
+            type_def_nids.setdefault(type_name, []).append(node["id"])
+            scope = kotlin_scope_by_file.get(str(node.get("source_file")))
+            if scope is not None:
+                package_name = str(scope.get("package") or "")
+                qualified_type_name = str(
+                    node.get("_kotlin_qualified_type_name") or type_name
+                )
+                fqn = (
+                    f"{package_name}.{qualified_type_name}"
+                    if package_name
+                    else qualified_type_name
+                )
+                type_def_nids_by_fqn.setdefault(fqn, []).append(node["id"])
+                type_fqn_by_nid[node["id"]] = fqn
+
+    inner_owner_by_type: dict[str, str] = {}
+    for node in all_nodes:
+        inner_owner_name = node.get("_kotlin_inner_owner_name")
+        if not inner_owner_name:
+            continue
+        source_file = str(node.get("source_file") or "")
+        scope = kotlin_scope_by_file.get(source_file)
+        package_name = str((scope or {}).get("package") or "")
+        owner_fqn = (
+            f"{package_name}.{inner_owner_name}"
+            if package_name
+            else str(inner_owner_name)
+        )
+        owner_defs = type_def_nids_by_fqn.get(owner_fqn, [])
+        if len(owner_defs) == 1:
+            inner_owner_by_type[node["id"]] = owner_defs[0]
+
+    # A capitalized Kotlin call may name either a constructor or a top-level
+    # function. Per-file extraction cannot see a competing factory in another
+    # source file, so constructor-derived receiver facts fail closed when the
+    # corpus contains a same-named top-level callable. Explicitly typed
+    # receivers remain safe and are not affected by this guard.
+    top_level_callable_names: set[str] = set()
+    top_level_callable_fqns: set[str] = set()
+    unknown_package_callable_names: set[str] = set()
+    for node in all_nodes:
+        source_file = str(node.get("source_file") or "")
+        if not (
+            node.get("id") in contained
+            and source_file.lower().endswith((".kt", ".kts"))
+            and not _is_type_like_definition(node)
+            and str(node.get("label") or "").endswith("()")
+        ):
+            continue
+        callable_name = key(node.get("label", ""))
+        top_level_callable_names.add(callable_name)
+        scope = kotlin_scope_by_file.get(source_file)
+        if scope is None:
+            unknown_package_callable_names.add(callable_name)
+            continue
+        package_name = str(scope.get("package") or "")
+        top_level_callable_fqns.add(
+            f"{package_name}.{callable_name}" if package_name else callable_name
+        )
+    for scope in kotlin_scope_by_file.values():
+        package_name = str(scope.get("package") or "")
+        for property_name in scope.get("properties", []):
+            property_name = str(property_name)
+            if not property_name:
+                continue
+            top_level_callable_names.add(property_name)
+            top_level_callable_fqns.add(
+                f"{package_name}.{property_name}"
+                if package_name
+                else property_name
+            )
+
+    def visible_qualified_fqns(
+        source_file: str,
+        local_name: str,
+        available_fqns: set[str],
+    ) -> set[str]:
+        """Return package/import-qualified symbols visible under ``local_name``."""
+        scope = kotlin_scope_by_file.get(source_file)
+        if scope is None:
+            return set()
+
+        package_name = str(scope.get("package") or "")
+        local_fqn = f"{package_name}.{local_name}" if package_name else local_name
+        visible = {local_fqn} if local_fqn in available_fqns else set()
+        for imported in scope.get("imports", []):
+            path = str(imported.get("path") or "")
+            if not path:
+                continue
+            if imported.get("star"):
+                imported_fqn = f"{path}.{local_name}"
+                if imported_fqn in available_fqns:
+                    visible.add(imported_fqn)
+                continue
+            visible_name = str(imported.get("alias") or path.rsplit(".", 1)[-1])
+            head, separator, suffix = local_name.partition(".")
+            if visible_name != head:
+                continue
+            imported_fqn = f"{path}.{suffix}" if separator else path
+            if imported_fqn in available_fqns:
+                visible.add(imported_fqn)
+        return visible
+
+    def visible_top_level_callable(source_file: str, local_name: str) -> bool:
+        """Whether a same-named function/callable property is visible here."""
+        if local_name in unknown_package_callable_names:
+            return True
+        if source_file not in kotlin_scope_by_file:
+            return local_name in top_level_callable_names
+        return bool(
+            visible_qualified_fqns(
+                source_file, local_name, top_level_callable_fqns
+            )
+        )
+
+    def resolve_type_defs(type_name: str, source_file: str) -> list[str]:
+        """Resolve a Kotlin receiver type through its package/import visibility."""
+        if source_file not in kotlin_scope_by_file:
+            if "." in type_name:
+                return type_def_nids_by_fqn.get(type_name, [])
+            return type_def_nids.get(key(type_name), [])
+
+        visible_fqns = visible_qualified_fqns(
+            source_file, type_name, set(type_def_nids_by_fqn)
+        )
+        if visible_fqns:
+            return [
+                nid
+                for fqn in visible_fqns
+                for nid in type_def_nids_by_fqn.get(fqn, [])
+            ]
+        if "." in type_name:
+            return type_def_nids_by_fqn.get(type_name, [])
+
+        # A scoped Kotlin reference that cannot be tied to its own package or an
+        # explicit import must not fall through to an unrelated corpus-global JVM
+        # type. Java package/typealias resolution is a separate, richer problem;
+        # fail closed here instead of fabricating a member edge.
+        return []
+
+    method_index: dict[tuple[str, str], set[str]] = {}
+    enclosing_type: dict[str, str] = {}
+    direct_supertypes: dict[str, set[str]] = {}
+    direct_class_supertypes: dict[str, set[str]] = {}
+    for edge in all_edges:
+        if edge.get("relation") not in ("inherits", "implements"):
+            continue
+        subtype, supertype = edge.get("source"), edge.get("target")
+        if subtype and supertype:
+            direct_supertypes.setdefault(subtype, set()).add(supertype)
+            if edge.get("relation") == "inherits":
+                direct_class_supertypes.setdefault(subtype, set()).add(supertype)
+    types_with_supertypes = set(direct_supertypes)
+    for edge in all_edges:
+        if edge.get("relation") != "method":
+            continue
+        owner, method = edge.get("source"), edge.get("target")
+        method_node = node_by_id.get(method)
+        if method_node is None:
+            continue
+        enclosing_type.setdefault(method, owner)
+        method_index.setdefault((owner, key(method_node.get("label", ""))), set()).add(
+            method
+        )
+    companion_method_index: dict[tuple[str, str], set[str]] = {}
+    companion_owner_by_method: dict[str, str] = {}
+    companion_operator_invokes = {
+        node["id"]
+        for node in all_nodes
+        if node.get("_kotlin_companion_operator_invoke")
+    }
+    for node in all_nodes:
+        companion_owner = node.get("_kotlin_companion_owner")
+        if companion_owner:
+            companion_owner_by_method[node["id"]] = companion_owner
+            companion_method_index.setdefault(
+                (companion_owner, key(node.get("label", ""))), set()
+            ).add(node["id"])
+
+    def type_is_or_inherits(type_nid: str | None, ancestor_nid: str) -> bool:
+        """Whether ``type_nid`` reaches ``ancestor_nid`` in the extracted hierarchy."""
+        if not type_nid:
+            return False
+        pending = [type_nid]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current == ancestor_nid:
+                return True
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(direct_supertypes.get(current, ()))
+        return False
+
+    def has_private_type_access(
+        caller_owner: str | None, declaring_owner: str
+    ) -> bool:
+        """Whether the caller is the declaring type or one of its nested types."""
+        if caller_owner == declaring_owner:
+            return True
+        caller_fqn = type_fqn_by_nid.get(caller_owner or "")
+        declaring_fqn = type_fqn_by_nid.get(declaring_owner)
+        if not caller_fqn or not declaring_fqn:
+            return False
+        return (
+            caller_fqn.startswith(f"{declaring_fqn}.")
+            and node_by_id.get(caller_owner, {}).get("source_file")
+            == node_by_id.get(declaring_owner, {}).get("source_file")
+        )
+
+    def owned_methods(
+        owner_nid: str, method_name: str, caller_owner: str | None
+    ) -> set[str]:
+        """Return owned methods visible from the caller's enclosing type."""
+        return {
+            method_nid
+            for method_nid in method_index.get((owner_nid, method_name), set())
+            if not node_by_id.get(method_nid, {}).get("_kotlin_private_function")
+            or has_private_type_access(caller_owner, owner_nid)
+        }
+
+    def nearest_methods(
+        type_nid: str, method_name: str, caller_owner: str | None
+    ) -> set[str]:
+        """Return direct or nearest inherited methods, failing closed per level."""
+        direct = owned_methods(type_nid, method_name, caller_owner)
+        if direct:
+            return direct
+        class_candidates = nearest_class_methods(
+            type_nid, method_name, caller_owner
+        )
+        if class_candidates:
+            return class_candidates
+        frontier = set(direct_supertypes.get(type_nid, ()))
+        seen = {type_nid}
+        while frontier:
+            candidates = {
+                method_nid
+                for owner_nid in frontier
+                for method_nid in owned_methods(
+                    owner_nid, method_name, caller_owner
+                )
+            }
+            if candidates:
+                return candidates
+            seen.update(frontier)
+            frontier = {
+                ancestor
+                for owner_nid in frontier
+                for ancestor in direct_supertypes.get(owner_nid, ())
+                if ancestor not in seen
+            }
+        return set()
+
+    def nearest_class_methods(
+        type_nid: str, method_name: str, caller_owner: str | None
+    ) -> set[str]:
+        """Return the nearest method along Kotlin's concrete class hierarchy."""
+        frontier = set(direct_class_supertypes.get(type_nid, ()))
+        seen = {type_nid}
+        while frontier:
+            candidates = {
+                method_nid
+                for owner_nid in frontier
+                for method_nid in owned_methods(
+                    owner_nid, method_name, caller_owner
+                )
+            }
+            if candidates:
+                return candidates
+            seen.update(frontier)
+            frontier = {
+                ancestor
+                for owner_nid in frontier
+                for ancestor in direct_class_supertypes.get(owner_nid, ())
+                if ancestor not in seen
+            }
+        return set()
+
+    def nearest_inherited_methods(
+        type_nid: str, method_name: str, caller_owner: str | None
+    ) -> set[str]:
+        """Return methods selected by an explicit ``super`` receiver."""
+        return nearest_class_methods(type_nid, method_name, caller_owner)
+
+    extension_index: dict[str, set[str]] = {}
+    extension_fqn_by_nid: dict[str, str] = {}
+    extension_fqns: set[str] = set()
+    for node in all_nodes:
+        receiver_type = node.get("_kotlin_extension_receiver_type")
+        if node.get("_kotlin_companion_owner") or not receiver_type or (
+            node.get("id") not in contained
+            and node.get("id") not in enclosing_type
+        ):
+            continue
+        extension_name = key(node.get("label", ""))
+        source_file = str(node.get("source_file") or "")
+        scope = kotlin_scope_by_file.get(source_file)
+        if not extension_name or scope is None:
+            continue
+        extension_index.setdefault(extension_name, set()).add(node["id"])
+        if node.get("id") in contained:
+            package_name = str(scope.get("package") or "")
+            extension_fqn = (
+                f"{package_name}.{extension_name}" if package_name else extension_name
+            )
+            extension_fqn_by_nid[node["id"]] = extension_fqn
+            extension_fqns.add(extension_fqn)
+
+    def extension_matches_type(extension_nid: str, type_nid: str) -> bool:
+        extension_node = node_by_id.get(extension_nid, {})
+        receiver_type = str(
+            extension_node.get("_kotlin_extension_receiver_type") or ""
+        )
+        type_node = node_by_id.get(type_nid, {})
+        type_name = key(type_node.get("label", ""))
+        if not receiver_type or key(receiver_type).rsplit(".", 1)[-1] != type_name:
+            return False
+        type_fqn = type_fqn_by_nid.get(type_nid)
+        if not type_fqn:
+            return False
+        source_file = str(extension_node.get("source_file") or "")
+        visible_fqns = visible_qualified_fqns(
+            source_file, receiver_type, set(type_def_nids_by_fqn)
+        )
+        if visible_fqns:
+            return type_fqn in visible_fqns
+        return receiver_type == type_fqn
+
+    def extension_is_visible(
+        extension_nid: str,
+        caller_nid: str,
+        caller_source_file: str,
+        local_name: str,
+    ) -> bool:
+        extension_node = node_by_id.get(extension_nid, {})
+        dispatch_owner = enclosing_type.get(extension_nid)
+        if dispatch_owner is not None:
+            if (
+                extension_node.get("_kotlin_private_function")
+                and not has_private_type_access(
+                    enclosing_type.get(caller_nid), dispatch_owner
+                )
+            ):
+                return False
+            caller_owner = enclosing_type.get(caller_nid)
+            seen_owners: set[str] = set()
+            while caller_owner and caller_owner not in seen_owners:
+                if type_is_or_inherits(caller_owner, dispatch_owner):
+                    return True
+                seen_owners.add(caller_owner)
+                caller_owner = inner_owner_by_type.get(caller_owner)
+            return False
+        extension_source_file = str(extension_node.get("source_file") or "")
+        if (
+            extension_node.get("_kotlin_private_function")
+            and extension_source_file != caller_source_file
+        ):
+            return False
+        if extension_source_file == caller_source_file:
+            return True
+        extension_fqn = extension_fqn_by_nid.get(extension_nid)
+        return bool(
+            extension_fqn
+            and extension_fqn
+            in visible_qualified_fqns(
+                caller_source_file, local_name, extension_fqns
+            )
+        )
+
+    def visible_extension_candidates(
+        source_file: str, local_name: str
+    ) -> set[str]:
+        """Return extensions visible under their declaration name or import alias."""
+        candidates = set(extension_index.get(local_name, set()))
+        scope = kotlin_scope_by_file.get(source_file)
+        if scope is None:
+            return candidates
+        for imported in scope.get("imports", []):
+            if imported.get("star") or imported.get("alias") != local_name:
+                continue
+            path = str(imported.get("path") or "")
+            declaration_name = path.rsplit(".", 1)[-1]
+            candidates.update(
+                extension_nid
+                for extension_nid in extension_index.get(declaration_name, set())
+                if extension_fqn_by_nid.get(extension_nid) == path
+            )
+        return candidates
+
+    def nearest_member_extensions(
+        candidates: set[str], caller_nid: str
+    ) -> set[str]:
+        """Prefer member extensions on the nearest dispatch receiver owner."""
+        member_candidates = {
+            extension_nid
+            for extension_nid in candidates
+            if extension_nid in enclosing_type
+        }
+        if not member_candidates:
+            return candidates
+        caller_owner = enclosing_type.get(caller_nid)
+        if not caller_owner:
+            return set()
+        def select_for_owner(owner_nid: str) -> set[str]:
+            direct = {
+                extension_nid
+                for extension_nid in member_candidates
+                if enclosing_type.get(extension_nid) == owner_nid
+            }
+            if direct:
+                return direct
+
+            class_frontier = set(direct_class_supertypes.get(owner_nid, ()))
+            class_seen = {owner_nid}
+            while class_frontier:
+                selected = {
+                    extension_nid
+                    for extension_nid in member_candidates
+                    if enclosing_type.get(extension_nid) in class_frontier
+                }
+                if selected:
+                    return selected
+                class_seen.update(class_frontier)
+                class_frontier = {
+                    ancestor
+                    for current_owner in class_frontier
+                    for ancestor in direct_class_supertypes.get(current_owner, ())
+                    if ancestor not in class_seen
+                }
+
+            frontier = set(direct_supertypes.get(owner_nid, ()))
+            seen = {owner_nid}
+            while frontier:
+                selected = {
+                    extension_nid
+                    for extension_nid in member_candidates
+                    if enclosing_type.get(extension_nid) in frontier
+                }
+                if selected:
+                    return selected
+                seen.update(frontier)
+                frontier = {
+                    ancestor
+                    for current_owner in frontier
+                    for ancestor in direct_supertypes.get(current_owner, ())
+                    if ancestor not in seen
+                }
+            return set()
+
+        seen_owners: set[str] = set()
+        while caller_owner and caller_owner not in seen_owners:
+            selected = select_for_owner(caller_owner)
+            if selected:
+                return selected
+            seen_owners.add(caller_owner)
+            caller_owner = inner_owner_by_type.get(caller_owner)
+        return set()
+
+    existing_pairs = {(edge.get("source"), edge.get("target")) for edge in all_edges}
+    for result in per_file:
+        for raw_call in result.get("raw_calls", []):
+            if raw_call.get("lang") != "kotlin" or not raw_call.get("is_member_call"):
+                continue
+            receiver = raw_call.get("receiver")
+            callee = raw_call.get("callee")
+            caller = raw_call.get("caller_nid")
+            if not callee or not caller:
+                continue
+
+            qualified_method_nids: set[str] | None = None
+            exact = (
+                receiver == "this"
+                and not raw_call.get("kotlin_extension_receiver")
+            )
+            if raw_call.get("kotlin_super_receiver"):
+                type_nid = enclosing_type.get(caller)
+                if not type_nid:
+                    continue
+                qualified_method_nids = nearest_inherited_methods(
+                    type_nid, key(callee), enclosing_type.get(caller)
+                )
+                exact = True
+            elif raw_call.get("kotlin_type_receiver_candidate"):
+                type_defs = resolve_type_defs(
+                    str(receiver), str(raw_call.get("source_file") or "")
+                )
+                if len(type_defs) != 1:
+                    continue
+                type_nid = type_defs[0]
+                if not node_by_id.get(type_nid, {}).get("_kotlin_object_definition"):
+                    qualified_method_nids = companion_method_index.get(
+                        (type_nid, key(callee)), set()
+                    )
+                    qualified_method_nids = {
+                        method_nid
+                        for method_nid in qualified_method_nids
+                        if not node_by_id.get(method_nid, {}).get(
+                            "_kotlin_private_function"
+                        )
+                        or has_private_type_access(
+                            enclosing_type.get(caller),
+                            companion_owner_by_method.get(method_nid, ""),
+                        )
+                    }
+                exact = True
+            elif exact:
+                type_nid = enclosing_type.get(caller)
+                if not type_nid:
+                    continue
+            else:
+                type_name = raw_call.get("receiver_type")
+                if not type_name:
+                    continue
+                if (
+                    raw_call.get("kotlin_constructor_candidate")
+                    and visible_top_level_callable(
+                        str(raw_call.get("source_file") or ""), key(type_name)
+                    )
+                ):
+                    continue
+                type_defs = resolve_type_defs(
+                    str(type_name), str(raw_call.get("source_file") or "")
+                )
+                if len(type_defs) != 1:
+                    continue
+                type_nid = type_defs[0]
+                if (
+                    raw_call.get("kotlin_constructor_candidate")
+                    and (
+                        node_by_id.get(type_nid, {}).get("_kotlin_object_definition")
+                        or type_nid in companion_operator_invokes
+                    )
+                ):
+                    continue
+
+            method_nids = (
+                qualified_method_nids
+                if qualified_method_nids is not None
+                else nearest_methods(
+                    type_nid, key(callee), enclosing_type.get(caller)
+                )
+            )
+            if len(method_nids) > 1:
+                continue
+            caller_source_file = str(raw_call.get("source_file") or "")
+            extension_nids = set()
+            if qualified_method_nids is None:
+                extension_nids = nearest_member_extensions({
+                    extension_nid
+                    for extension_nid in visible_extension_candidates(
+                        caller_source_file, key(callee)
+                    )
+                    if extension_matches_type(extension_nid, type_nid)
+                    and extension_is_visible(
+                        extension_nid,
+                        caller,
+                        caller_source_file,
+                        key(callee),
+                    )
+                }, caller)
+            # Kotlin member functions outrank extensions only when the member is
+            # applicable. The graph currently has names but no parameter-arity
+            # facts, so a same-receiver member/extension pair cannot be selected
+            # soundly; fail closed instead of manufacturing the member edge.
+            if method_nids and extension_nids:
+                continue
+            if extension_nids and type_nid in types_with_supertypes:
+                continue
+            target_nid = next(iter(method_nids), None)
+            target_exact = exact
+            if target_nid is None:
+                if len(extension_nids) != 1:
+                    continue
+                target_nid = next(iter(extension_nids))
+                target_exact = (
+                    str(node_by_id.get(target_nid, {}).get("source_file") or "")
+                    == caller_source_file
+                )
+            if target_nid == caller or (caller, target_nid) in existing_pairs:
+                continue
+            existing_pairs.add((caller, target_nid))
+            all_edges.append({
+                "source": caller,
+                "target": target_nid,
+                "relation": "calls",
+                "context": "call",
+                "confidence": "EXTRACTED" if target_exact else "INFERRED",
+                "confidence_score": 1.0 if target_exact else 0.8,
+                "source_file": raw_call.get("source_file", ""),
+                "source_location": raw_call.get("source_location"),
+                "weight": 1.0,
+            })
+
+
 def _resolve_objc_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -2830,6 +3475,13 @@ register_language_resolver(
 )
 register_language_resolver(
     LanguageResolver("java_member_calls", frozenset({".java"}), _resolve_java_member_calls)
+)
+register_language_resolver(
+    LanguageResolver(
+        "kotlin_member_calls",
+        frozenset({".kt", ".kts"}),
+        _resolve_kotlin_member_calls,
+    )
 )
 # Pascal/Delphi cross-file inherited-method-call resolution: a call from a
 # manual descendant class to a method it inherits from an ancestor declared
@@ -4972,6 +5624,13 @@ def extract(
     for n in all_nodes:
         n.pop("origin_file", None)
         n.pop("_callable", None)  # internal indirect_call marker — never ships to graph.json
+        n.pop("_kotlin_extension_receiver_type", None)
+        n.pop("_kotlin_object_definition", None)
+        n.pop("_kotlin_qualified_type_name", None)
+        n.pop("_kotlin_companion_owner", None)
+        n.pop("_kotlin_companion_operator_invoke", None)
+        n.pop("_kotlin_private_function", None)
+        n.pop("_kotlin_inner_owner_name", None)
 
     # Tag AST provenance so the incremental watch rebuild can distinguish
     # AST-extracted nodes from semantic/LLM nodes. On a full re-extraction
