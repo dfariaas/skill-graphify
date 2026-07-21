@@ -3566,7 +3566,14 @@ def _xaml_csharp_class_nodes(path: Path) -> dict[str, list[dict]]:
     except OSError:
         return classes
     for cs_path in cs_files:
-        if any(_is_noise_dir(part) for part in cs_path.parts):
+        # Check only project-relative components.  Absolute build sandboxes
+        # commonly mount sources below ``/build``; treating that ancestor as a
+        # project noise directory would hide every ViewModel from XAML linking.
+        try:
+            relative_parts = cs_path.relative_to(root).parts
+        except ValueError:
+            relative_parts = cs_path.parts
+        if any(_is_noise_dir(part) for part in relative_parts[:-1]):
             continue
         if patterns and _is_ignored(cs_path, root, patterns, _cache=ignore_cache):
             continue
@@ -5262,9 +5269,10 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
         return bool(patterns and _is_ignored(p, ignore_root, patterns, _cache=ignore_cache))
 
     if not follow_symlinks:
-        # The old rglob filter rejected paths with a noise component anywhere,
-        # including components of target itself — preserve that.
-        if any(_is_noise_dir(part) for part in target.parts):
+        # Only reject if the target directory *itself* is a noise dir (e.g.
+        # node_modules passed directly).  Do NOT check ancestor path components
+        # — that would incorrectly exclude projects living inside .worktrees/.
+        if _is_noise_dir(target.name):
             return []
         # When negation (!) patterns exist, skip directory-level ignore pruning
         # so negated files inside ignored dirs can still be reached (same

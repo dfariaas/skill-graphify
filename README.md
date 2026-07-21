@@ -130,6 +130,7 @@ Every system ran on the same harness with the same model and budgets, scored by 
 | Python | 3.10+ | `python --version` | [python.org](https://www.python.org/downloads/) |
 | uv *(recommended)* | any | `uv --version` | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | pipx *(alternative)* | any | `pipx --version` | `pip install pipx` |
+| Nix *(alternative)* | 2.4+ (flakes enabled) | `nix --version` | [nixos.org](https://nixos.org/download/) |
 
 **macOS quick install (Homebrew):**
 ```bash
@@ -164,6 +165,51 @@ uv tool install graphifyy
 pipx install graphifyy
 pip install graphifyy  # may need PATH setup — see note below
 ```
+
+**Nix (flake):**
+
+Run directly without installing:
+```bash
+nix run github:caniko/graphify
+```
+
+To expose `graphify` as a package inside another flake, add it as an input and reference its default package:
+```nix
+{
+  inputs = {
+    graphify.url = "github:caniko/graphify";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  };
+
+  outputs = { nixpkgs, graphify, ... }: {
+    let
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+    in {
+      devShells.${system}.default = pkgs.mkShell {
+        buildInputs = [ graphify.packages.${system}.default ];
+      };
+    };
+  };
+}
+```
+
+The flake and GitHub Actions workflow are generated and checked by
+[simit](https://codeberg.org/caniko/simit). After changing the flake outputs,
+refresh the generated wiring and verify the same checks CI runs:
+
+```bash
+simit init flake --check --diff
+simit init ci --platform github --runtime nix --check --diff
+nix flake check --no-build
+nix build .#checks.x86_64-linux.pytest
+```
+
+Keep `simit.toml`, `nix/pre-commit.nix`, and `.github/workflows/ci.yaml` in
+sync; the workflow intentionally builds the named `pytest` check instead of
+duplicating a second Python dependency installation path.
+
+---
 
 **Step 2 — register the skill with your AI assistant:**
 
