@@ -200,41 +200,54 @@ def _call_tool(client, headers, name, arguments, rid) -> str:
     return resp.json()["result"]["content"][0]["text"]
 
 
-def test_project_path_is_optional_on_every_tool(tmp_path):
-    """Multi-project support is additive: every tool gains an optional
-    project_path, and none of them makes it required."""
+def test_graph_param_is_optional_on_every_tool(tmp_path):
+    """Every tool gains an optional graph param (but list_graphs is exempt since
+    it sets the graph, not queries one); none makes it required."""
     app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
     with _client(app) as client:
         headers = _init_session(client)
         resp = client.post("/mcp", headers=headers,
                             json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         for tool in resp.json()["result"]["tools"]:
+            if tool["name"] == "list_graphs":
+                continue
             props = tool["inputSchema"].get("properties", {})
-            assert "project_path" in props, f"{tool['name']} missing project_path"
-            assert "project_path" not in tool["inputSchema"].get("required", [])
+            assert "graph" in props, f"{tool['name']} missing graph param"
+            assert "graph" not in tool["inputSchema"].get("required", [])
 
 
-def test_project_path_routes_to_that_projects_graph(tmp_path):
-    """One running server answers against the default graph when project_path is
-    omitted, and against a project's own graph when it is supplied."""
-    proj = _project_with_graph(tmp_path, node_count=3)  # default graph has 2 nodes
-    app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
+def test_graph_param_routes_to_that_graph(tmp_path):
+    """A multi-graph server answers the default graph when graph param is omitted
+    and a specific graph when graph param is provided."""
+    # Write two graph directories
+    alpha_dir = tmp_path / "alpha"
+    alpha_dir.mkdir()
+    beta_dir = tmp_path / "beta"
+    beta_dir.mkdir()
+    alpha_graph = {"directed": True, "nodes": [{"id": "a", "label": "A", "community": 0}], "edges": []}
+    beta_graph = {"directed": True, "nodes": [
+        {"id": "b1", "label": "B1", "community": 0},
+        {"id": "b2", "label": "B2", "community": 0},
+        {"id": "b3", "label": "B3", "community": 0},
+    ], "edges": []}
+    (alpha_dir / "graph.json").write_text(json.dumps(alpha_graph), encoding="utf-8")
+    (beta_dir / "graph.json").write_text(json.dumps(beta_graph), encoding="utf-8")
+    registry = serve_mod.GraphRegistry.from_directory(tmp_path)
+    app = serve_mod._build_http_app(registry=registry, json_response=True)
     with _client(app) as client:
         headers = _init_session(client)
-        assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=2)
-        assert "Nodes: 3" in _call_tool(client, headers, "graph_stats", {"project_path": proj}, rid=3)
-        # Falling back to the default afterwards still works (no state leak).
-        assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=4)
+        assert "Nodes: 1" in _call_tool(client, headers, "graph_stats", {"graph": "alpha"}, rid=2)
+        assert "Nodes: 3" in _call_tool(client, headers, "graph_stats", {"graph": "beta"}, rid=3)
 
 
-def test_bad_project_path_errors_without_killing_server(tmp_path):
-    """A missing project graph is a tool error, not a process exit — the server
-    keeps serving the default graph."""
+def test_bad_graph_param_errors_without_killing_server(tmp_path):
+    """A bad graph name is a tool error, not a process exit — the server
+    keeps serving other graphs."""
     app = serve_mod._build_http_app(_graph_file(tmp_path), json_response=True)
     with _client(app) as client:
         headers = _init_session(client)
         bad = _call_tool(client, headers, "graph_stats",
-                         {"project_path": str(tmp_path / "does-not-exist")}, rid=2)
+                         {"graph": "does-not-exist"}, rid=2)
         assert "not found" in bad.lower()
         assert "Nodes: 2" in _call_tool(client, headers, "graph_stats", {}, rid=3)
 

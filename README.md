@@ -485,6 +485,34 @@ docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
 > python3 -m venv .venv && .venv/bin/pip install "graphifyy[mcp]"
 > ```
 
+### Multi-graph MCP server
+
+Serve multiple knowledge graphs from a single endpoint — useful for multi-repo setups, monorepos with per-service graphs, or comparing codebases.
+
+```bash
+# structure: one folder per graph
+my-graphs/
+  frontend/graph.json
+  backend/graph.json
+  shared-lib/graph.json
+
+# run with Docker
+docker build --target multi -t graphify-multi .
+docker run -p 8080:8080 -v "$(pwd)/my-graphs:/graphs:ro" graphify-multi
+
+# or with docker-compose
+docker compose -f docker-compose.multi.yml up --build
+```
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `GRAPHS_DIR` | `/graphs` | Mount point to scan for `<name>/graph.json` |
+| `SCAN_INTERVAL` | `30` | Seconds between auto-discovery rescans |
+| `PORT` | `8080` | HTTP listen port |
+| `GRAPHIFY_API_KEY` | — | Require `Authorization: Bearer <key>` |
+
+Tools: same as single-graph (`query_graph`, `get_node`, `get_neighbors`, etc.) plus `list_graphs` and `use_graph`. Each tool accepts an optional `graph` parameter to target a specific graph, or use `use_graph` to set a session default.
+
 ---
 
 ## Environment variables

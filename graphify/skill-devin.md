@@ -32,6 +32,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify <path> --neo4j                              # generate graphify-out/cypher.txt for Neo4j
 /graphify <path> --neo4j-push bolt://localhost:7687   # push directly to Neo4j
 /graphify <path> --mcp                                # start MCP stdio server for agent access
+/graphify <path> --multi-mcp                          # start multi-graph MCP Docker server
 /graphify <path> --watch                              # watch folder, auto-rebuild on code changes (no LLM needed)
 /graphify <path> --wiki                               # build agent-crawlable wiki (index.md + one article per community)
 /graphify add <url>                                   # fetch URL, save to ./raw, update graph

@@ -4,7 +4,9 @@ import json
 import math
 import re
 import sys
+import threading
 from array import array
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NamedTuple
 import networkx as nx
@@ -17,6 +19,131 @@ try:
     import jieba as _jieba  # type: ignore[import-untyped]
 except ImportError:
     _jieba = None
+
+
+@dataclass
+class GraphContext:
+    name: str
+    path: Path
+    graph: nx.Graph
+    communities: dict[int, list[str]]
+    mtime: float
+
+
+class GraphRegistry:
+    def __init__(self) -> None:
+        self._graphs: dict[str, GraphContext] = {}
+        self._graphs_dir: Path | None = None
+        self._lock = threading.Lock()
+
+    @classmethod
+    def from_path(cls, graph_path: Path) -> "GraphRegistry":
+        reg = cls()
+        graph_path = Path(graph_path).resolve()
+        G = _load_graph(str(graph_path))
+        _get_trigram_index(G)
+        communities = _communities_from_graph(G)
+        name = graph_path.parent.name or "default"
+        mtime = graph_path.stat().st_mtime
+        reg._graphs[name] = GraphContext(
+            name=name, path=graph_path, graph=G,
+            communities=communities, mtime=mtime,
+        )
+        return reg
+
+    @classmethod
+    def from_directory(cls, graphs_dir: Path) -> "GraphRegistry":
+        reg = cls()
+        reg._graphs_dir = Path(graphs_dir)
+        reg._do_scan()
+        return reg
+
+    def rescan(self) -> None:
+        if self._graphs_dir is not None:
+            self._do_scan()
+        else:
+            self._reload_single()
+
+    def _reload_single(self) -> None:
+        with self._lock:
+            for name, ctx in list(self._graphs.items()):
+                try:
+                    s = ctx.path.stat()
+                    if s.st_mtime != ctx.mtime:
+                        G = _load_graph(str(ctx.path))
+                        _get_trigram_index(G)
+                        communities = _communities_from_graph(G)
+                        self._graphs[name] = GraphContext(
+                            name=name, path=ctx.path, graph=G,
+                            communities=communities, mtime=s.st_mtime,
+                        )
+                except (OSError, SystemExit, Exception):
+                    del self._graphs[name]
+
+    def _do_scan(self) -> None:
+        import logging
+        if self._graphs_dir is None:
+            return
+        logger = logging.getLogger(__name__)
+        found: dict[str, GraphContext] = {}
+        for entry in sorted(self._graphs_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            graph_file = entry / "graph.json"
+            if not graph_file.exists():
+                continue
+            name = entry.name
+            try:
+                mtime = graph_file.stat().st_mtime
+            except OSError:
+                continue
+            existing = self._graphs.get(name)
+            if existing is not None and existing.mtime == mtime:
+                found[name] = existing
+                continue
+            try:
+                G = _load_graph(str(graph_file))
+            except (SystemExit, Exception) as exc:
+                logger.warning("skipping %s: %s", graph_file, exc)
+                continue
+            _get_trigram_index(G)
+            communities = _communities_from_graph(G)
+            found[name] = GraphContext(
+                name=name, path=graph_file, graph=G,
+                communities=communities, mtime=mtime,
+            )
+            logger.info("loaded graph %r (%d nodes)", name, G.number_of_nodes())
+        with self._lock:
+            self._graphs = found
+
+    def get(self, name: str) -> GraphContext | None:
+        return self._graphs.get(name)
+
+    def names(self) -> list[str]:
+        return sorted(self._graphs.keys())
+
+
+def _resolve_graph(
+    registry: GraphRegistry,
+    *,
+    graph: str | None = None,
+    current: str | None = None,
+) -> GraphContext:
+    name = graph or current
+    if name is not None:
+        ctx = registry.get(name)
+        if ctx is None:
+            raise ValueError(f"graph {name!r} not found. Available: {registry.names()}")
+        return ctx
+    names = registry.names()
+    if not names:
+        raise ValueError("no graphs loaded")
+    if len(names) == 1:
+        return registry.get(names[0])
+    raise ValueError(
+        f"multiple graphs available ({', '.join(names)}), "
+        "specify with graph param or use_graph()"
+    )
 
 
 def _load_graph(graph_path: str) -> nx.Graph:
@@ -1100,16 +1227,16 @@ def _community_header(cid: int, community_name) -> str:
     return base
 
 
-def _build_server(graph_path: str):
+def _build_server(registry: GraphRegistry, *, session_state: dict | None = None):
     """Build the configured low-level MCP Server (shared by every transport).
 
     All graph query tools and resources are registered here over a single
     ``mcp.server.Server`` instance; the caller picks the transport (stdio or
-    Streamable HTTP) and runs it. Hot-reload of graph.json works the same way
-    regardless of transport, since reloads happen inside the tool handlers.
-    """
-    import threading
+    Streamable HTTP) and runs it. Graph resolution goes through the registry,
+    supporting both single-graph and multi-graph deployments.
 
+    Returns ``(server, handlers)`` — the handlers dict is exposed for testing.
+    """
     try:
         from mcp.server import Server
         from mcp import types
@@ -1117,75 +1244,17 @@ def _build_server(graph_path: str):
     except ImportError as e:
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
 
-    from graphify import paths as _paths
+    if session_state is None:
+        session_state = {}
+    is_multi = len(registry.names()) > 1
 
-    # Per-graph context cache: resolved graph.json path -> {key, G, communities}.
-    # The server's default graph is just the first entry; a tool call carrying a
-    # project_path adds its own. Routing every graph through one cache means the
-    # eager trigram index and the mtime+size hot-reload behave identically for
-    # the default graph and for any project graph.
-    _default_graph_path = graph_path
-    _ctx_lock = threading.Lock()
-    _ctx_cache: dict[str, dict] = {}
-
-    def _load_ctx(path: str):
-        """Return (G, communities) for a graph.json path, reusing a cached
-        context until the file's (mtime, size) changes and then transparently
-        rebuilding it. Unlike ``_load_graph`` it never exits the process on a
-        missing/corrupt file — it raises, so a bad project_path surfaces as a
-        tool error instead of killing a server that is happily serving other
-        projects."""
-        try:
-            s = Path(path).stat()
-            key = (s.st_mtime_ns, s.st_size)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"graph.json not found: {path}")
-        ent = _ctx_cache.get(path)
-        if ent is not None and ent["key"] == key:
-            return ent["G"], ent["communities"]
-        with _ctx_lock:
-            ent = _ctx_cache.get(path)
-            if ent is not None and ent["key"] == key:
-                return ent["G"], ent["communities"]  # another thread built it
-            try:
-                new_G = _load_graph(path)
-            except SystemExit as e:  # _load_graph exits on missing/corrupt file
-                raise RuntimeError(f"could not load graph.json at {path}") from e
-            # Warm the trigram index before exposing the graph so the first query
-            # against it is fast (same rationale as the original startup warm-up).
-            _get_trigram_index(new_G)
-            comm = _communities_from_graph(new_G)
-            _ctx_cache[path] = {"key": key, "G": new_G, "communities": comm}
-            return new_G, comm
-
-    def _resolve_graph_path(project_path) -> str:
-        """Map an optional project_path to a concrete graph.json path. ``None``
-        keeps the server's default graph (backward-compatible); a project_path
-        resolves to ``<project_path>/<GRAPHIFY_OUT>/graph.json``, honouring the
-        GRAPHIFY_OUT override so worktree/shared-output setups keep working."""
-        if not project_path:
-            return _default_graph_path
-        return str(Path(project_path) / _paths.GRAPHIFY_OUT / "graph.json")
-
-    # Active per-request context, rebound by _select_graph() and read by the tool
-    # handlers below. No lock needed on the hot path: _select_graph and the
-    # handler run in one synchronous stretch of each call_tool coroutine (no
-    # await between them), so a concurrent call never observes a half-applied
-    # swap.
-    active_graph_path = _default_graph_path
-    try:
-        G, communities = _load_ctx(_default_graph_path)
-    except (FileNotFoundError, RuntimeError):
-        # No default graph at startup → run as a pure multi-project server. Tools
-        # then require project_path; a call without one gets a clear error rather
-        # than the process refusing to start (which is what _load_graph would do).
-        G, communities = None, {}
-
-    def _select_graph(project_path) -> None:
-        nonlocal G, communities, active_graph_path
-        path = _resolve_graph_path(project_path)
-        G, communities = _load_ctx(path)
-        active_graph_path = path
+    def _get_ctx(arguments: dict) -> GraphContext:
+        graph_param = arguments.pop("graph", None)
+        return _resolve_graph(
+            registry,
+            graph=graph_param,
+            current=session_state.get("current_graph"),
+        )
 
     server = Server("graphify")
 
@@ -1269,7 +1338,26 @@ def _build_server(graph_path: str):
                     "required": ["source", "target"],
                 },
             ),
-            types.Tool(
+        ]
+        if is_multi:
+            _tools.append(types.Tool(
+                name="list_graphs",
+                description="List all available knowledge graphs with node/edge/community counts.",
+                inputSchema={"type": "object", "properties": {}},
+            ))
+            _tools.append(types.Tool(
+                name="use_graph",
+                description="Set the default graph for this session.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "graph": {"type": "string", "description": "Name of the graph to use"},
+                    },
+                    "required": ["graph"],
+                },
+            ))
+        else:
+            _tools.append(types.Tool(
                 name="list_prs",
                 description=(
                     "List open GitHub PRs with CI status, review state, and graph impact "
@@ -1283,8 +1371,8 @@ def _build_server(graph_path: str):
                         "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
                     },
                 },
-            ),
-            types.Tool(
+            ))
+            _tools.append(types.Tool(
                 name="get_pr_impact",
                 description=(
                     "Get detailed graph impact for a specific PR: which files it changes, "
@@ -1299,8 +1387,8 @@ def _build_server(graph_path: str):
                     },
                     "required": ["pr_number"],
                 },
-            ),
-            types.Tool(
+            ))
+            _tools.append(types.Tool(
                 name="triage_prs",
                 description=(
                     "Return all actionable open PRs (correct base, not stale) with full graph impact data "
@@ -1314,26 +1402,21 @@ def _build_server(graph_path: str):
                         "repo": {"type": "string", "description": "GitHub repo (owner/repo). Defaults to current repo."},
                     },
                 },
-            ),
-        ]
-        # Multi-project support: every tool accepts an optional project_path.
-        # Injected here (rather than repeated in 11 literal schemas) so the set
-        # stays in lockstep as tools are added. Omitting it keeps the historical
-        # single-graph behaviour, so this is purely additive for existing callers.
+            ))
+        # Inject graph param into every tool except list_graphs (which sets the graph, not queries one).
         for _t in _tools:
-            _t.inputSchema.setdefault("properties", {})["project_path"] = {
-                "type": "string",
-                "description": (
-                    "Absolute path to a project directory containing "
-                    "graphify-out/graph.json. Optional — defaults to the graph "
-                    "this server was started with."
-                ),
-            }
+            if _t.name not in ("list_graphs", "use_graph"):
+                _t.inputSchema.setdefault("properties", {})["graph"] = {
+                    "type": "string",
+                    "description": "Target graph name. Overrides session default.",
+                }
         return _tools
 
     def _tool_query_graph(arguments: dict) -> str:
         import time as _time
         from graphify import querylog
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
         question = arguments["question"]
         mode = arguments.get("mode", "bfs")
         depth = min(int(arguments.get("depth", 3)), 6)
@@ -1351,7 +1434,7 @@ def _build_server(graph_path: str):
         querylog.log_query(
             kind="mcp_query",
             question=question,
-            corpus=str(active_graph_path),
+            corpus=str(ctx.path),
             result=result,
             mode=mode,
             depth=depth,
@@ -1361,6 +1444,8 @@ def _build_server(graph_path: str):
         return result
 
     def _tool_get_node(arguments: dict) -> str:
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
         label = arguments["label"].lower()
         matches = [(nid, d) for nid, d in G.nodes(data=True)
                    if label in (d.get("label") or "").lower() or label == nid.lower()]
@@ -1378,6 +1463,8 @@ def _build_server(graph_path: str):
         ])
 
     def _tool_get_neighbors(arguments: dict) -> str:
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
         label = arguments["label"].lower()
         rel_filter = arguments.get("relation_filter", "").lower()
         matches = _find_node(G, label)
@@ -1417,6 +1504,9 @@ def _build_server(graph_path: str):
         )
 
     def _tool_get_community(arguments: dict) -> str:
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
+        communities = ctx.communities
         cid = int(arguments["community_id"])
         nodes = communities.get(cid, [])
         if not nodes:
@@ -1437,12 +1527,17 @@ def _build_server(graph_path: str):
 
     def _tool_god_nodes(arguments: dict) -> str:
         from graphify.analyze import god_nodes as _god_nodes
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
         nodes = _god_nodes(G, top_n=int(arguments.get("top_n", 10)))
         lines = ["God nodes (most connected):"]
         lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
         return "\n".join(lines)
 
-    def _tool_graph_stats(_: dict) -> str:
+    def _tool_graph_stats(arguments: dict) -> str:
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
+        communities = ctx.communities
         confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
         total = len(confs) or 1
         return (
@@ -1455,6 +1550,8 @@ def _build_server(graph_path: str):
         )
 
     def _tool_shortest_path(arguments: dict) -> str:
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
         src_scored = _score_nodes(G, [t.lower() for t in arguments["source"].split()])
         tgt_scored = _score_nodes(G, [t.lower() for t in arguments["target"].split()])
         if not src_scored:
@@ -1525,6 +1622,7 @@ def _build_server(graph_path: str):
         return prefix + f"Shortest path ({hops} hops):\n  " + " ".join(segments)
 
     def _tool_list_prs(arguments: dict) -> str:
+        arguments.pop("graph", None)  # list_prs doesn't route to a graph
         from graphify.prs import fetch_prs, fetch_worktrees, format_prs_text, _detect_default_branch
         repo = arguments.get("repo") or None
         base = arguments.get("base") or _detect_default_branch(repo)
@@ -1538,6 +1636,8 @@ def _build_server(graph_path: str):
         return format_prs_text(prs, base)
 
     def _tool_get_pr_impact(arguments: dict) -> str:
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
         from graphify.prs import fetch_pr_files, compute_pr_impact, _gh, _parse_ci
         number = int(arguments["pr_number"])
         repo = arguments.get("repo") or None
@@ -1568,6 +1668,8 @@ def _build_server(graph_path: str):
         return "\n".join(lines)
 
     def _tool_triage_prs(arguments: dict) -> str:
+        ctx = _get_ctx(arguments)
+        G = ctx.graph
         from concurrent.futures import ThreadPoolExecutor, as_completed
         from graphify.prs import fetch_prs, fetch_worktrees, fetch_pr_files, compute_pr_impact, _STATUS_ORDER, _detect_default_branch
         repo = arguments.get("repo") or None
@@ -1609,7 +1711,31 @@ def _build_server(graph_path: str):
             )
         return "\n\n".join(lines)
 
-    _handlers = {
+    def _tool_list_graphs(arguments: dict) -> str:
+        lines = []
+        for name in registry.names():
+            ctx = registry.get(name)
+            if ctx is None:
+                continue
+            G = ctx.graph
+            lines.append(
+                f"{name}: {G.number_of_nodes()} nodes, "
+                f"{G.number_of_edges()} edges, "
+                f"{len(ctx.communities)} communities"
+            )
+        if not lines:
+            return "No graphs loaded."
+        return "\n".join(lines)
+
+    def _tool_use_graph(arguments: dict) -> str:
+        name = arguments["graph"]
+        ctx = registry.get(name)
+        if ctx is None:
+            return f"Graph {name!r} not found. Available: {registry.names()}"
+        session_state["current_graph"] = name
+        return f"Switched to graph {name!r} ({ctx.graph.number_of_nodes()} nodes)"
+
+    _handlers: dict = {
         "query_graph": _tool_query_graph,
         "get_node": _tool_get_node,
         "get_neighbors": _tool_get_neighbors,
@@ -1617,19 +1743,24 @@ def _build_server(graph_path: str):
         "god_nodes": _tool_god_nodes,
         "graph_stats": _tool_graph_stats,
         "shortest_path": _tool_shortest_path,
-        "list_prs": _tool_list_prs,
-        "get_pr_impact": _tool_get_pr_impact,
-        "triage_prs": _tool_triage_prs,
     }
+    if is_multi:
+        _handlers["list_graphs"] = _tool_list_graphs
+        _handlers["use_graph"] = _tool_use_graph
+    else:
+        _handlers["list_prs"] = _tool_list_prs
+        _handlers["get_pr_impact"] = _tool_get_pr_impact
+        _handlers["triage_prs"] = _tool_triage_prs
 
     def _load_community_labels() -> dict[int, str]:
-        labels_path = Path(active_graph_path).parent / ".graphify_labels.json"
+        ctx = _resolve_graph(registry, current=session_state.get("current_graph"))
+        labels_path = ctx.path.parent / ".graphify_labels.json"
         if labels_path.exists():
             try:
                 return {int(k): v for k, v in json.loads(labels_path.read_text(encoding="utf-8")).items()}
             except Exception:
                 pass
-        return {cid: f"Community {cid}" for cid in communities}
+        return {cid: f"Community {cid}" for cid in ctx.communities}
 
     @server.list_resources()
     async def list_resources() -> list[types.Resource]:
@@ -1644,7 +1775,10 @@ def _build_server(graph_path: str):
 
     @server.read_resource()
     async def read_resource(uri: AnyUrl) -> str:
-        _select_graph(None)  # resources read the server's default graph
+        ctx = _resolve_graph(registry, current=session_state.get("current_graph"))
+        G = ctx.graph
+        communities = ctx.communities
+        active_graph_path = str(ctx.path)
         uri_str = str(uri)
         if uri_str == "graphify://report":
             report_path = Path(active_graph_path).parent / "GRAPH_REPORT.md"
@@ -1652,9 +1786,22 @@ def _build_server(graph_path: str):
                 return report_path.read_text(encoding="utf-8")
             return "GRAPH_REPORT.md not found. Run graphify extract first."
         if uri_str == "graphify://stats":
-            return _tool_graph_stats({})
+            confs = [d.get("confidence", "EXTRACTED") for _, _, d in G.edges(data=True)]
+            total = len(confs) or 1
+            return (
+                f"Nodes: {G.number_of_nodes()}\n"
+                f"Edges: {G.number_of_edges()}\n"
+                f"Communities: {len(communities)}\n"
+                f"EXTRACTED: {round(confs.count('EXTRACTED')/total*100)}%\n"
+                f"INFERRED: {round(confs.count('INFERRED')/total*100)}%\n"
+                f"AMBIGUOUS: {round(confs.count('AMBIGUOUS')/total*100)}%\n"
+            )
         if uri_str == "graphify://god-nodes":
-            return _tool_god_nodes({"top_n": 10})
+            from graphify.analyze import god_nodes as _god_nodes
+            nodes = _god_nodes(G, top_n=10)
+            lines = ["God nodes (most connected):"]
+            lines += [f"  {i}. {n['label']} - {n['degree']} edges" for i, n in enumerate(nodes, 1)]
+            return "\n".join(lines)
         if uri_str == "graphify://surprises":
             try:
                 from graphify.analyze import surprising_connections
@@ -1697,17 +1844,15 @@ def _build_server(graph_path: str):
     @server.call_tool()
     async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         arguments = dict(arguments or {})
-        project_path = arguments.pop("project_path", None)
         handler = _handlers.get(name)
         if not handler:
             return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
         try:
-            _select_graph(project_path)  # bind G/communities to the target graph
             return [types.TextContent(type="text", text=handler(arguments))]
         except Exception as exc:
             return [types.TextContent(type="text", text=f"Error executing {name}: {exc}")]
 
-    return server
+    return server, _handlers
 
 
 def serve(graph_path: str | None = None) -> None:
@@ -1719,7 +1864,8 @@ def serve(graph_path: str | None = None) -> None:
         raise ImportError('mcp not installed. Run: pip install "graphifyy[mcp]"') from e
     import asyncio
 
-    server = _build_server(graph_path)
+    registry = GraphRegistry.from_path(Path(graph_path))
+    server, _ = _build_server(registry)
 
     async def main() -> None:
         async with stdio_server() as streams:
@@ -1787,8 +1933,9 @@ class _ApiKeyMiddleware:
 
 
 def _build_http_app(
-    graph_path: str,
+    graph_path: str | None = None,
     *,
+    registry: GraphRegistry | None = None,
     host: str = "127.0.0.1",
     port: int = 8080,
     api_key: str | None = None,
@@ -1826,7 +1973,9 @@ def _build_http_app(
     # mistaken for "auth on" — normalize it to None so the gate is unambiguous.
     api_key = (api_key or "").strip() or None
 
-    server = _build_server(graph_path)
+    if registry is None:
+        registry = GraphRegistry.from_path(Path(graph_path))
+    server, _ = _build_server(registry)
 
     # DNS-rebinding protection. When the operator binds a wildcard address they
     # are intentionally exposing the server, so accept any Host header; for a
@@ -1871,6 +2020,7 @@ def _build_http_app(
 def serve_http(
     graph_path: str | None = None,
     *,
+    registry: GraphRegistry | None = None,
     host: str = "127.0.0.1",
     port: int = 8080,
     api_key: str | None = None,
@@ -1889,8 +2039,12 @@ def serve_http(
     check (``Authorization: Bearer <key>`` or ``X-API-Key: <key>``). OAuth is a
     deliberate follow-up. Binding ``0.0.0.0`` exposes the server beyond
     localhost — set an api_key when you do.
+
+    ``registry`` can be supplied directly for multi-graph mode (``--graphs-dir``);
+    when provided ``graph_path`` is ignored.
     """
-    graph_path = graph_path or _default_graph_json()
+    if registry is None:
+        graph_path = graph_path or _default_graph_json()
     try:
         import uvicorn
     except ImportError as e:
@@ -1903,6 +2057,7 @@ def serve_http(
 
     app = _build_http_app(
         graph_path,
+        registry=registry,
         host=host,
         port=port,
         api_key=api_key,
@@ -1977,12 +2132,50 @@ def _main(argv: list[str] | None = None) -> None:
         default=3600.0,
         help="Reap stateful sessions idle this many seconds (default: 3600; 0 disables)",
     )
+    parser.add_argument(
+        "--graphs-dir",
+        default=os.environ.get("GRAPHS_DIR"),
+        metavar="PATH",
+        help="Directory of graph subdirs for multi-graph mode (env: GRAPHS_DIR). Forces HTTP transport.",
+    )
     args = parser.parse_args(argv)
-    graph_path = args.graph_flag or args.graph_path or _default_graph_json()
 
-    if args.transport == "http":
+    if args.graphs_dir:
+        graphs_dir = Path(args.graphs_dir)
+        if not graphs_dir.is_dir():
+            print(f"error: --graphs-dir {graphs_dir} does not exist", file=sys.stderr)
+            sys.exit(1)
+        if args.transport == "stdio":
+            print("error: --graphs-dir requires HTTP transport (multi-graph over stdio is not supported)", file=sys.stderr)
+            sys.exit(1)
+        registry = GraphRegistry.from_directory(graphs_dir)
+        if not registry.names():
+            print(f"error: no graphs found in {graphs_dir}/ (expected <name>/graph.json)", file=sys.stderr)
+            sys.exit(1)
+        scan_interval = int(os.environ.get("SCAN_INTERVAL", "30"))
+        print(
+            f"graphify multi-graph MCP: {len(registry.names())} graphs from {graphs_dir}",
+            file=sys.stderr,
+        )
+        for name in registry.names():
+            ctx = registry.get(name)
+            print(f"  {name}: {ctx.graph.number_of_nodes()} nodes", file=sys.stderr)
+
+        def _rescan_loop():
+            import time
+            while True:
+                time.sleep(scan_interval)
+                try:
+                    registry.rescan()
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning("rescan failed: %s", exc)
+
+        rescan_thread = threading.Thread(target=_rescan_loop, daemon=True)
+        rescan_thread.start()
+
         serve_http(
-            graph_path,
+            registry=registry,
             host=args.host,
             port=args.port,
             api_key=args.api_key,
@@ -1992,7 +2185,20 @@ def _main(argv: list[str] | None = None) -> None:
             session_timeout=args.session_timeout,
         )
     else:
-        serve(graph_path)
+        graph_path = args.graph_flag or args.graph_path or _default_graph_json()
+        if args.transport == "http":
+            serve_http(
+                graph_path,
+                host=args.host,
+                port=args.port,
+                api_key=args.api_key,
+                path=args.path,
+                json_response=args.json_response,
+                stateless=args.stateless,
+                session_timeout=args.session_timeout,
+            )
+        else:
+            serve(graph_path)
 
 
 if __name__ == "__main__":
