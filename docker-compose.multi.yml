@@ -1,0 +1,18 @@
+# docker-compose.multi.yml
+# Quick start for multi-graph MCP server.
+#
+# Place graphs as:  ./my-graphs/<project-name>/graph.json
+# Start:            docker compose -f docker-compose.multi.yml up --build
+services:
+  graphify-mcp:
+    build:
+      context: .
+      target: multi
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./my-graphs:/graphs:ro
+    environment:
+      - SCAN_INTERVAL=30
+      - PORT=8080
+      # - GRAPHIFY_API_KEY=your-secret-key

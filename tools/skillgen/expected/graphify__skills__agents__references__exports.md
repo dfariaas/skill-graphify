@@ -76,6 +76,20 @@ To configure in Claude Desktop, add to `claude_desktop_config.json`. Claude Desk
 }
 ```
 
+### Step 7e - Multi-graph MCP server (only if --multi-mcp flag)
+
+For serving multiple graphs from one endpoint:
+
+```bash
+# structure: my-graphs/<name>/graph.json
+docker build --target multi -t graphify-multi .
+docker run -p 8080:8080 -v "$(pwd)/my-graphs:/graphs:ro" graphify-multi
+```
+
+This starts an HTTP/SSE MCP server that auto-discovers all `<name>/graph.json` in the mounted `/graphs` volume. Tools: `list_graphs`, `use_graph`, plus all single-graph tools (`query_graph`, `get_node`, `get_neighbors`, `get_community`, `god_nodes`, `graph_stats`, `shortest_path`) — each with an optional `graph` parameter.
+
+Set `GRAPHS_DIR`, `SCAN_INTERVAL`, `PORT`, `GRAPHIFY_API_KEY` env vars to configure.
+
 ### Step 8 - Token reduction benchmark (only if total_words > 5000)
 
 If `total_words` from `graphify-out/.graphify_detect.json` is greater than 5,000, run:

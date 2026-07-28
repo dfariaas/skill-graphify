@@ -1,14 +1,15 @@
-# graphify MCP server as a shared HTTP service (issue #1143).
+# graphify MCP server — single-graph and multi-graph targets.
 #
-# Build:  docker build -t graphify .
-# Run:    docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
-#             /data/graph.json --transport http --host 0.0.0.0 --api-key "$SECRET"
+# Single-graph (existing, default):
+#   docker build -t graphify .
+#   docker run -p 8080:8080 -v "$(pwd)/graphify-out:/data" graphify \
+#       /data/graph.json --transport http --host 0.0.0.0 --api-key "$SECRET"
 #
-# Builds from source so the image includes the Streamable HTTP transport even
-# before it lands on PyPI. The graph.json is mounted at runtime (-v), never
-# baked into the image.
-FROM python:3.12-slim
+# Multi-graph:
+#   docker build --target multi -t graphify-multi .
+#   docker run -p 8080:8080 -v "$(pwd)/my-graphs:/graphs:ro" graphify-multi
 
+FROM python:3.12-slim AS base
 WORKDIR /app
 COPY . /app
 
@@ -19,7 +20,17 @@ RUN pip install --no-cache-dir ".[mcp]"
 RUN useradd --create-home --uid 10001 graphify
 USER graphify
 
+# --- Single-graph target (default, backward-compatible) ---
+FROM base AS single
 EXPOSE 8080
-
 ENTRYPOINT ["python", "-m", "graphify.serve"]
 CMD ["/data/graph.json", "--transport", "http", "--host", "0.0.0.0", "--port", "8080"]
+
+# --- Multi-graph target ---
+FROM base AS multi
+EXPOSE 8080
+VOLUME /graphs
+ENV GRAPHS_DIR=/graphs
+ENV SCAN_INTERVAL=30
+ENV PORT=8080
+ENTRYPOINT ["graphify-mcp", "--transport", "http", "--host", "0.0.0.0"]
