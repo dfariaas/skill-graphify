@@ -4,8 +4,11 @@ Full release notes with details on each version: [GitHub Releases](https://githu
 
 ## 0.9.39 (unreleased)
 
-- Feature: `--viz 3d` renders `graph.html` as a navigable WebGL view. The default
-  2D renderer remains unchanged.
+- Feature: `--viz 3d` renders `graph.html` as a navigable, fully offline WebGL
+  view with search, community filters, hop-focused inspection, bounded labels,
+  and community aggregation above the visualization node limit. The exact
+  3d-force-graph browser bundle is packaged and embedded with its license and
+  integrity digest; the default 2D renderer remains unchanged.
 
 - Fix: `affected` now traverses a dynamic `import('…')` made inside a function or at module scope (#2584, thanks @phudayyy). The 0.9.38 dedupe keyed only on the target, so an in-function dynamic import (whose symbol-level edge is anchored on the enclosing function) suppressed the file-level edge `affected` follows; the dedupe now keys on the importing file, emitting one file-level `dynamic_import` edge per file/target while keeping the call-site edge.
 - Fix: a Python member call on an untyped receiver (`x.get(...)`) no longer binds by name alone to a same-named module-level function, fabricating a false high-confidence `calls` edge and a god node (#2417, #2586, thanks @EZZEASY). Such a call is now resolved only with receiver-type, import, or `self`/`cls`/`super` evidence, matching the TypeScript fix from 0.9.37; `super().method()` still resolves.
