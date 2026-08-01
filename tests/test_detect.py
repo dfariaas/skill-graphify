@@ -2086,9 +2086,12 @@ def test_convert_office_file_does_not_rewrite_existing_sidecar(tmp_path, monkeyp
     assert second.stat().st_mtime_ns == mtime_before
 
 
-def _minimal_ipynb(cells):
+def _minimal_ipynb(cells, metadata=None):
     import json
-    return json.dumps({"cells": cells, "nbformat": 4, "nbformat_minor": 5})
+    nb = {"cells": cells, "nbformat": 4, "nbformat_minor": 5}
+    if metadata is not None:
+        nb["metadata"] = metadata
+    return json.dumps(nb)
 
 
 def test_classify_ipynb():
@@ -2098,15 +2101,18 @@ def test_classify_ipynb():
 def test_ipynb_to_markdown_mixed_cells(tmp_path):
     nb_path = tmp_path / "nb.ipynb"
     nb_path.write_text(
-        _minimal_ipynb([
-            {"cell_type": "markdown", "source": "# Title\n\nIntro text."},
-            {
-                "cell_type": "code",
-                "source": "import pandas as pd\nprint('hi')",
-                "outputs": [{"output_type": "stream", "text": "hi\n"}],
-            },
-            {"cell_type": "markdown", "source": "## Section"},
-        ]),
+        _minimal_ipynb(
+            [
+                {"cell_type": "markdown", "source": "# Title\n\nIntro text."},
+                {
+                    "cell_type": "code",
+                    "source": "import pandas as pd\nprint('hi')",
+                    "outputs": [{"output_type": "stream", "text": "hi\n"}],
+                },
+                {"cell_type": "markdown", "source": "## Section"},
+            ],
+            metadata={"language_info": {"name": "python"}},
+        ),
         encoding="utf-8",
     )
     md = detect_mod.ipynb_to_markdown(nb_path)
@@ -2115,6 +2121,46 @@ def test_ipynb_to_markdown_mixed_cells(tmp_path):
     assert "hi\n" not in md  # outputs stripped
     assert "## Section" in md
     assert md.index("# Title") < md.index("```python") < md.index("## Section")
+
+
+def test_ipynb_to_markdown_uses_non_python_kernel_language(tmp_path):
+    """Notebooks are not Python-only: the fence must name the kernel language."""
+    nb_path = tmp_path / "survey.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb(
+            [{"cell_type": "code", "source": "summary(df)"}],
+            metadata={"kernelspec": {"language": "R"}},
+        ),
+        encoding="utf-8",
+    )
+    assert "```R\nsummary(df)" in detect_mod.ipynb_to_markdown(nb_path)
+
+
+def test_ipynb_to_markdown_falls_back_to_generic_fence(tmp_path):
+    """A notebook with no language metadata still fences its code cells."""
+    nb_path = tmp_path / "bare.ipynb"
+    nb_path.write_text(
+        _minimal_ipynb([{"cell_type": "code", "source": "x = 1"}]),
+        encoding="utf-8",
+    )
+    assert "```code\nx = 1" in detect_mod.ipynb_to_markdown(nb_path)
+
+
+def test_ipynb_to_markdown_accepts_string_source(tmp_path):
+    """nbformat allows `source` as a plain string as well as a list of lines."""
+    import json
+
+    nb_path = tmp_path / "str.ipynb"
+    nb_path.write_text(
+        json.dumps({
+            "cells": [{"cell_type": "code", "source": "x = 1"}],
+            "metadata": {"language_info": {"name": "python"}},
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }),
+        encoding="utf-8",
+    )
+    assert "```python\nx = 1" in detect_mod.ipynb_to_markdown(nb_path)
 
 
 def test_ipynb_to_markdown_empty_notebook(tmp_path):
@@ -2266,7 +2312,69 @@ def test_detect_incremental_ignores_notebook_output_only_changes(tmp_path):
     assert not inc["new_files"]["document"]
     assert str(sidecar) in inc["unchanged_files"]["document"]
 
-    
+
+def test_convert_notebook_file_sidecar_name_stable_across_checkouts(tmp_path):
+    """#2059: like Office sidecars, the notebook sidecar name must derive from the
+    scan-root-RELATIVE path so two clones of the same repo agree on it."""
+    def _sidecar(root):
+        src = root / "notebooks" / "analysis.ipynb"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_text(
+            _minimal_ipynb([{"cell_type": "code", "source": "x = 1"}]),
+            encoding="utf-8",
+        )
+        return detect_mod.convert_notebook_file(
+            src, root / "graphify-out" / "converted", root=root
+        )
+
+    out_a = _sidecar(tmp_path / "checkout-a")
+    out_b = _sidecar(tmp_path / "somewhere-else" / "checkout-b")
+    assert out_a is not None and out_b is not None
+    assert out_a.name == out_b.name, "sidecar name must be stable across checkouts (#2059)"
+    assert out_a.parent != out_b.parent  # sanity: genuinely different locations
+
+    # No explicit root -> the out_dir.parent.parent fallback yields the same name.
+    fallback = detect_mod.convert_notebook_file(
+        tmp_path / "checkout-a" / "notebooks" / "analysis.ipynb",
+        tmp_path / "checkout-a" / "graphify-out" / "converted",
+    )
+    assert fallback is not None and fallback.name == out_a.name
+
+
+def test_convert_notebook_file_hash_disambiguates_same_stem(tmp_path):
+    """Same-stem notebooks in different subdirs must still get distinct sidecars."""
+    root = tmp_path / "repo"
+    for sub in ("a", "b"):
+        nb = root / sub / "analysis.ipynb"
+        nb.parent.mkdir(parents=True)
+        nb.write_text(
+            _minimal_ipynb([{"cell_type": "code", "source": f"x = '{sub}'"}]),
+            encoding="utf-8",
+        )
+    out_dir = root / "graphify-out" / "converted"
+    out_a = detect_mod.convert_notebook_file(root / "a" / "analysis.ipynb", out_dir, root=root)
+    out_b = detect_mod.convert_notebook_file(root / "b" / "analysis.ipynb", out_dir, root=root)
+    assert out_a is not None and out_b is not None
+    assert out_a.name != out_b.name, "same-stem notebooks in different dirs must differ (#2059)"
+
+
+def test_convert_notebook_file_outside_root_falls_back(tmp_path):
+    """A notebook outside the scan root falls back to the absolute-path hash
+    without raising, and stays deterministic."""
+    root = tmp_path / "repo"
+    out_dir = root / "graphify-out" / "converted"
+    out_dir.mkdir(parents=True)
+    outside = tmp_path / "elsewhere" / "analysis.ipynb"
+    outside.parent.mkdir(parents=True)
+    outside.write_text(
+        _minimal_ipynb([{"cell_type": "code", "source": "x = 1"}]),
+        encoding="utf-8",
+    )
+    out1 = detect_mod.convert_notebook_file(outside, out_dir, root=root)
+    out2 = detect_mod.convert_notebook_file(outside, out_dir, root=root)
+    assert out1 is not None and out1.name == out2.name
+
+
 def test_convert_office_file_sidecar_name_stable_across_checkouts(tmp_path, monkeypatch):
     """#2059: the sidecar name must depend on the scan-root-RELATIVE path, not the
     absolute checkout location, so the same tracked file in two clones/worktrees

@@ -809,13 +809,16 @@ def ipynb_to_markdown(path: Path) -> str:
     except Exception:
         return ""
 
-    
-def convert_notebook_file(path: Path, out_dir: Path) -> Path | None:
+
+def convert_notebook_file(path: Path, out_dir: Path, root: "Path | None" = None) -> Path | None:
     """Convert a .ipynb to a markdown sidecar in out_dir.
 
-    Mirrors convert_office_file() sidecar naming. Unlike office files, an
-    existing sidecar is refreshed when cell sources change but left untouched
-    when only outputs/metadata changed — notebook re-runs must not re-extract.
+    Naming mirrors convert_office_file(). The rewrite check does not: office
+    files compare mtimes, but re-running a notebook rewrites the .ipynb with
+    fresh outputs and execution counts while every cell source stays the same.
+    Comparing the extracted markdown instead keeps the sidecar (and its mtime)
+    untouched through a re-run, so detect_incremental does not re-extract a
+    notebook whose code and prose never changed.
     """
     if path.suffix.lower() not in NOTEBOOK_EXTENSIONS:
         return None
@@ -825,14 +828,31 @@ def convert_notebook_file(path: Path, out_dir: Path) -> Path | None:
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Hash the scan-root-RELATIVE path for the same reason convert_office_file
+    # does: an absolute key salts the name with the checkout location, so one
+    # tracked notebook in two clones emits two byte-identical sidecars (#2059).
+    # NFC-normalize first to survive macOS NFD path drift (#1226).
     import hashlib
     import unicodedata
-    normalized_path = unicodedata.normalize("NFC", str(path.resolve()))
+    if root is None:
+        # Default layout: out_dir is <root>/<graphify-out>/converted.
+        root = out_dir.parent.parent
+    try:
+        key = path.resolve().relative_to(Path(root).resolve()).as_posix()
+    except (ValueError, OSError):
+        # Outside the scan root (--include sources, custom GRAPHIFY_OUT
+        # layouts): keep the absolute form rather than guessing.
+        key = str(path.resolve())
+    normalized_path = unicodedata.normalize("NFC", key)
     name_hash = hashlib.sha256(normalized_path.encode()).hexdigest()[:8]
     out_path = out_dir / f"{path.stem}_{name_hash}.md"
     payload = f"<!-- converted from {path.name} -->\n\n{text}"
-    if out_path.exists() and out_path.read_text(encoding="utf-8") == payload:
-        return out_path
+    try:
+        with open(_os_path(out_path), encoding="utf-8") as f:
+            if f.read() == payload:
+                return out_path
+    except OSError:
+        pass
     out_path.write_text(payload, encoding="utf-8")
     return out_path
 
@@ -1452,13 +1472,14 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
                     # Conversion failed (library not installed) - skip with note
                     skipped_sensitive.append(str(p) + " [office conversion failed - pip install graphifyy[office]]")
                 continue
+            # Notebooks: same sidecar treatment as Office files
             if p.suffix.lower() in NOTEBOOK_EXTENSIONS:
-                md_path = convert_notebook_file(p, converted_dir)
+                md_path = convert_notebook_file(p, converted_dir, root=root)
                 if md_path:
                     if _is_ignored(md_path, root, ignore_patterns, _cache=ignore_cache):
                         continue
                     files[ftype].append(str(md_path))
-                    total_words += count_words(md_path)
+                    total_words += _wc(md_path)
                 else:
                     skipped_sensitive.append(str(p) + " [notebook conversion failed]")
                 continue
