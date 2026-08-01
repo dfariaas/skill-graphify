@@ -710,6 +710,29 @@ def xlsx_extract_structure(path: Path) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
+def _sidecar_path(path: Path, out_dir: Path, root: "Path | None" = None) -> Path:
+    """Stable markdown-sidecar path for a converted source file.
+
+    Hashes the scan-root-RELATIVE path (not the absolute path): the absolute
+    form salts the name with the checkout location, so the same tracked file
+    in two clones/worktrees emits differently-named byte-identical sidecars
+    when graphify-out/ is committed (#2059). NFC-normalize first so macOS
+    NFD path drift cannot rename the sidecar across runs (#1226). Sources
+    outside the scan root fall back to the absolute form.
+    """
+    import hashlib
+    import unicodedata
+    if root is None:
+        # Default layout: out_dir is <root>/<graphify-out>/converted.
+        root = out_dir.parent.parent
+    try:
+        key = path.resolve().relative_to(Path(root).resolve()).as_posix()
+    except (ValueError, OSError):
+        key = str(path.resolve())
+    name_hash = hashlib.sha256(unicodedata.normalize("NFC", key).encode()).hexdigest()[:8]
+    return out_dir / f"{path.stem}_{name_hash}.md"
+
+
 def convert_office_file(path: Path, out_dir: Path, root: "Path | None" = None) -> Path | None:
     """Convert a .docx or .xlsx to a markdown sidecar in out_dir.
 
@@ -728,33 +751,7 @@ def convert_office_file(path: Path, out_dir: Path, root: "Path | None" = None) -
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Use a stable name derived from the original path to avoid collisions.
-    # Hash the path RELATIVE to the scan root, not the absolute path: the
-    # absolute form salts the name with the checkout location, so the same
-    # tracked .xlsx in two clones/worktrees emits two differently-named,
-    # byte-identical sidecars — unbounded duplicates when graphify-out/ is
-    # committed, each ingested as a distinct source doc (#2059). The relative
-    # path still disambiguates same-stem files in different directories.
-    # Normalize to NFC before hashing: on macOS (HFS+/APFS) os.walk/rglob return
-    # filenames in NFD, while Python string literals and directly-constructed
-    # Path objects are NFC, so the same source file would otherwise hash to
-    # different sidecar names across runs — making --update treat every Office
-    # file as new and re-extract it (#1226).
-    import hashlib
-    import unicodedata
-    if root is None:
-        # Default layout: out_dir is <root>/<graphify-out>/converted.
-        root = out_dir.parent.parent
-    try:
-        key = path.resolve().relative_to(Path(root).resolve()).as_posix()
-    except (ValueError, OSError):
-        # Not under the scan root (custom GRAPHIFY_OUT layouts, --include
-        # sources, direct API callers): keep the previous absolute form rather
-        # than guessing, so behavior is unchanged for those cases.
-        key = str(path.resolve())
-    normalized_path = unicodedata.normalize("NFC", key)
-    name_hash = hashlib.sha256(normalized_path.encode()).hexdigest()[:8]
-    out_path = out_dir / f"{path.stem}_{name_hash}.md"
+    out_path = _sidecar_path(path, out_dir, root=root)
     # Skip re-writing only when the sidecar is present AND at least as new as the
     # source. detect_incremental tracks the SIDECAR (not the Office source), so a
     # sidecar that is never rewritten after the source changes leaves the doc
@@ -813,12 +810,11 @@ def ipynb_to_markdown(path: Path) -> str:
 def convert_notebook_file(path: Path, out_dir: Path, root: "Path | None" = None) -> Path | None:
     """Convert a .ipynb to a markdown sidecar in out_dir.
 
-    Naming mirrors convert_office_file(). The rewrite check does not: office
-    files compare mtimes, but re-running a notebook rewrites the .ipynb with
-    fresh outputs and execution counts while every cell source stays the same.
-    Comparing the extracted markdown instead keeps the sidecar (and its mtime)
-    untouched through a re-run, so detect_incremental does not re-extract a
-    notebook whose code and prose never changed.
+    Naming uses :func:`_sidecar_path` (same as Office). The rewrite check does
+    not share the Office mtime gate: re-running a notebook rewrites the .ipynb
+    with fresh outputs/execution counts while cell sources stay the same.
+    Comparing extracted markdown keeps the sidecar mtime untouched through a
+    re-run, so detect_incremental does not re-extract unchanged notebooks.
     """
     if path.suffix.lower() not in NOTEBOOK_EXTENSIONS:
         return None
@@ -828,24 +824,7 @@ def convert_notebook_file(path: Path, out_dir: Path, root: "Path | None" = None)
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Hash the scan-root-RELATIVE path for the same reason convert_office_file
-    # does: an absolute key salts the name with the checkout location, so one
-    # tracked notebook in two clones emits two byte-identical sidecars (#2059).
-    # NFC-normalize first to survive macOS NFD path drift (#1226).
-    import hashlib
-    import unicodedata
-    if root is None:
-        # Default layout: out_dir is <root>/<graphify-out>/converted.
-        root = out_dir.parent.parent
-    try:
-        key = path.resolve().relative_to(Path(root).resolve()).as_posix()
-    except (ValueError, OSError):
-        # Outside the scan root (--include sources, custom GRAPHIFY_OUT
-        # layouts): keep the absolute form rather than guessing.
-        key = str(path.resolve())
-    normalized_path = unicodedata.normalize("NFC", key)
-    name_hash = hashlib.sha256(normalized_path.encode()).hexdigest()[:8]
-    out_path = out_dir / f"{path.stem}_{name_hash}.md"
+    out_path = _sidecar_path(path, out_dir, root=root)
     payload = f"<!-- converted from {path.name} -->\n\n{text}"
     try:
         with open(_os_path(out_path), encoding="utf-8") as f:

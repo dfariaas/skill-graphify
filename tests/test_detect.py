@@ -2196,24 +2196,24 @@ def test_detect_converts_notebook_to_sidecar(tmp_path):
     assert result["total_words"] > 0
 
 
-def test_convert_notebook_file_empty_notebook_no_sidecar(tmp_path):
-    nb_path = tmp_path / "empty.ipynb"
-    nb_path.write_text(_minimal_ipynb([]), encoding="utf-8")
+def test_convert_notebook_file_rewrite_semantics(tmp_path):
+    """Single entry-point for convert_notebook_file unit coverage.
+
+    Keeps afferent coupling on the converter low (one test caller + detect)
+    while still checking empty notebooks, output-only re-runs, and source edits.
+    """
     out_dir = tmp_path / "converted"
-    assert detect_mod.convert_notebook_file(nb_path, out_dir) is None
+
+    empty = tmp_path / "empty.ipynb"
+    empty.write_text(_minimal_ipynb([]), encoding="utf-8")
+    assert detect_mod.convert_notebook_file(empty, out_dir) is None
     assert not list(out_dir.glob("*.md"))
 
-
-def test_convert_notebook_file_output_change_preserves_sidecar_mtime(tmp_path):
-    """Re-running a notebook updates outputs in the .ipynb but not the sidecar."""
     nb_path = tmp_path / "analysis.ipynb"
     nb_path.write_text(
-        _minimal_ipynb([
-            {"cell_type": "code", "source": "print(1)", "outputs": []},
-        ]),
+        _minimal_ipynb([{"cell_type": "code", "source": "print(1)", "outputs": []}]),
         encoding="utf-8",
     )
-    out_dir = tmp_path / "converted"
     sidecar = detect_mod.convert_notebook_file(nb_path, out_dir)
     assert sidecar is not None
     mtime_before = sidecar.stat().st_mtime_ns
@@ -2232,17 +2232,6 @@ def test_convert_notebook_file_output_change_preserves_sidecar_mtime(tmp_path):
     again = detect_mod.convert_notebook_file(nb_path, out_dir)
     assert again == sidecar
     assert again.stat().st_mtime_ns == mtime_before
-
-
-def test_convert_notebook_file_source_change_rewrites_sidecar(tmp_path):
-    nb_path = tmp_path / "analysis.ipynb"
-    nb_path.write_text(
-        _minimal_ipynb([{"cell_type": "code", "source": "x = 1", "outputs": []}]),
-        encoding="utf-8",
-    )
-    out_dir = tmp_path / "converted"
-    sidecar = detect_mod.convert_notebook_file(nb_path, out_dir)
-    mtime_before = sidecar.stat().st_mtime_ns
 
     nb_path.write_text(
         _minimal_ipynb([{"cell_type": "code", "source": "x = 2", "outputs": []}]),
@@ -2313,66 +2302,38 @@ def test_detect_incremental_ignores_notebook_output_only_changes(tmp_path):
     assert str(sidecar) in inc["unchanged_files"]["document"]
 
 
-def test_convert_notebook_file_sidecar_name_stable_across_checkouts(tmp_path):
-    """#2059: like Office sidecars, the notebook sidecar name must derive from the
-    scan-root-RELATIVE path so two clones of the same repo agree on it."""
-    def _sidecar(root):
-        src = root / "notebooks" / "analysis.ipynb"
+def test_sidecar_path_stable_across_checkouts_and_stems(tmp_path):
+    """#2059: notebook/office sidecar names come from scan-root-relative paths."""
+    def _name(root, rel):
+        src = root / rel
         src.parent.mkdir(parents=True, exist_ok=True)
-        src.write_text(
-            _minimal_ipynb([{"cell_type": "code", "source": "x = 1"}]),
-            encoding="utf-8",
-        )
-        return detect_mod.convert_notebook_file(
-            src, root / "graphify-out" / "converted", root=root
-        )
+        src.write_text("placeholder", encoding="utf-8")
+        return detect_mod._sidecar_path(src, root / "graphify-out" / "converted", root=root).name
 
-    out_a = _sidecar(tmp_path / "checkout-a")
-    out_b = _sidecar(tmp_path / "somewhere-else" / "checkout-b")
-    assert out_a is not None and out_b is not None
-    assert out_a.name == out_b.name, "sidecar name must be stable across checkouts (#2059)"
-    assert out_a.parent != out_b.parent  # sanity: genuinely different locations
-
-    # No explicit root -> the out_dir.parent.parent fallback yields the same name.
-    fallback = detect_mod.convert_notebook_file(
-        tmp_path / "checkout-a" / "notebooks" / "analysis.ipynb",
-        tmp_path / "checkout-a" / "graphify-out" / "converted",
+    assert _name(tmp_path / "checkout-a", "notebooks/analysis.ipynb") == _name(
+        tmp_path / "somewhere-else" / "checkout-b", "notebooks/analysis.ipynb"
     )
-    assert fallback is not None and fallback.name == out_a.name
 
-
-def test_convert_notebook_file_hash_disambiguates_same_stem(tmp_path):
-    """Same-stem notebooks in different subdirs must still get distinct sidecars."""
     root = tmp_path / "repo"
-    for sub in ("a", "b"):
-        nb = root / sub / "analysis.ipynb"
-        nb.parent.mkdir(parents=True)
-        nb.write_text(
-            _minimal_ipynb([{"cell_type": "code", "source": f"x = '{sub}'"}]),
-            encoding="utf-8",
-        )
-    out_dir = root / "graphify-out" / "converted"
-    out_a = detect_mod.convert_notebook_file(root / "a" / "analysis.ipynb", out_dir, root=root)
-    out_b = detect_mod.convert_notebook_file(root / "b" / "analysis.ipynb", out_dir, root=root)
-    assert out_a is not None and out_b is not None
-    assert out_a.name != out_b.name, "same-stem notebooks in different dirs must differ (#2059)"
+    name_a = _name(root, "a/analysis.ipynb")
+    name_b = _name(root, "b/analysis.ipynb")
+    assert name_a != name_b
 
-
-def test_convert_notebook_file_outside_root_falls_back(tmp_path):
-    """A notebook outside the scan root falls back to the absolute-path hash
-    without raising, and stays deterministic."""
-    root = tmp_path / "repo"
+    # Outside the scan root: absolute fallback is deterministic.
     out_dir = root / "graphify-out" / "converted"
-    out_dir.mkdir(parents=True)
     outside = tmp_path / "elsewhere" / "analysis.ipynb"
     outside.parent.mkdir(parents=True)
-    outside.write_text(
-        _minimal_ipynb([{"cell_type": "code", "source": "x = 1"}]),
-        encoding="utf-8",
+    outside.write_text("x", encoding="utf-8")
+    assert detect_mod._sidecar_path(outside, out_dir, root=root) == detect_mod._sidecar_path(
+        outside, out_dir, root=root
     )
-    out1 = detect_mod.convert_notebook_file(outside, out_dir, root=root)
-    out2 = detect_mod.convert_notebook_file(outside, out_dir, root=root)
-    assert out1 is not None and out1.name == out2.name
+
+    # No explicit root -> out_dir.parent.parent fallback matches explicit root.
+    checkout = tmp_path / "checkout-a"
+    src = checkout / "notebooks" / "analysis.ipynb"
+    explicit = detect_mod._sidecar_path(src, checkout / "graphify-out" / "converted", root=checkout)
+    fallback = detect_mod._sidecar_path(src, checkout / "graphify-out" / "converted")
+    assert explicit.name == fallback.name
 
 
 def test_convert_office_file_sidecar_name_stable_across_checkouts(tmp_path, monkeypatch):
