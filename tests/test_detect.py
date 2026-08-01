@@ -2302,13 +2302,15 @@ def test_detect_incremental_ignores_notebook_output_only_changes(tmp_path):
     assert str(sidecar) in inc["unchanged_files"]["document"]
 
 
-def test_sidecar_path_stable_across_checkouts_and_stems(tmp_path):
-    """#2059: notebook/office sidecar names come from scan-root-relative paths."""
+def test_notebook_sidecar_path_stable_across_checkouts_and_stems(tmp_path):
+    """#2059: notebook sidecar names come from scan-root-relative paths."""
     def _name(root, rel):
         src = root / rel
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_text("placeholder", encoding="utf-8")
-        return detect_mod._sidecar_path(src, root / "graphify-out" / "converted", root=root).name
+        return detect_mod._notebook_sidecar_path(
+            src, root / "graphify-out" / "converted", root=root
+        ).name
 
     assert _name(tmp_path / "checkout-a", "notebooks/analysis.ipynb") == _name(
         tmp_path / "somewhere-else" / "checkout-b", "notebooks/analysis.ipynb"
@@ -2324,15 +2326,16 @@ def test_sidecar_path_stable_across_checkouts_and_stems(tmp_path):
     outside = tmp_path / "elsewhere" / "analysis.ipynb"
     outside.parent.mkdir(parents=True)
     outside.write_text("x", encoding="utf-8")
-    assert detect_mod._sidecar_path(outside, out_dir, root=root) == detect_mod._sidecar_path(
+    assert detect_mod._notebook_sidecar_path(
         outside, out_dir, root=root
-    )
+    ) == detect_mod._notebook_sidecar_path(outside, out_dir, root=root)
 
     # No explicit root -> out_dir.parent.parent fallback matches explicit root.
     checkout = tmp_path / "checkout-a"
     src = checkout / "notebooks" / "analysis.ipynb"
-    explicit = detect_mod._sidecar_path(src, checkout / "graphify-out" / "converted", root=checkout)
-    fallback = detect_mod._sidecar_path(src, checkout / "graphify-out" / "converted")
+    converted = checkout / "graphify-out" / "converted"
+    explicit = detect_mod._notebook_sidecar_path(src, converted, root=checkout)
+    fallback = detect_mod._notebook_sidecar_path(src, converted)
     assert explicit.name == fallback.name
 
 
