@@ -98,3 +98,43 @@ def test_remap_communities_to_previous_assigns_deterministic_new_ids():
     assert list(remapped.keys()) == [0, 1]
     assert remapped[0] == ["x", "y", "z"]
     assert remapped[1] == ["m"]
+
+
+def test_split_community_forwards_resolution_to_partition(monkeypatch):
+    from graphify import cluster as cluster_mod
+
+    seen: list[float] = []
+
+    def fake_partition(G, resolution=1.0):
+        seen.append(resolution)
+        return {n: 0 for n in G.nodes}
+
+    monkeypatch.setattr(cluster_mod, "_partition", fake_partition)
+    G = nx.complete_graph(6)
+    G = nx.relabel_nodes(G, {i: str(i) for i in G.nodes})
+    cluster_mod._split_community(G, list(G.nodes), resolution=3.0)
+    assert seen == [3.0]
+
+
+def test_cluster_forwards_resolution_to_split_passes(monkeypatch):
+    from graphify import cluster as cluster_mod
+
+    seen: list[float] = []
+
+    def fake_split(G, nodes, resolution=1.0):
+        seen.append(resolution)
+        return [sorted(nodes)]
+
+    monkeypatch.setattr(cluster_mod, "_split_community", fake_split)
+
+    # Two 20-node cliques joined by a single edge: 40 nodes total, so max_size is
+    # max(10, 40 * 0.25) = 10 and each clique trips the oversized-split path.
+    G = nx.Graph()
+    for offset in (0, 20):
+        clique = [f"n{offset + i}" for i in range(20)]
+        G.add_edges_from((a, b) for i, a in enumerate(clique) for b in clique[i + 1:])
+    G.add_edge("n0", "n20")
+
+    cluster_mod.cluster(G, resolution=0.5)
+    assert seen, "expected the oversized-community split path to run"
+    assert set(seen) == {0.5}
