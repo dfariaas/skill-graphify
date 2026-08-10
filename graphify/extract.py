@@ -42,6 +42,7 @@ from graphify.extractors.csharp import (
 from graphify.extractors.dart import extract_dart  # noqa: F401
 from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract_dmm  # noqa: F401
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
+from graphify.extractors.gleam import extract_gleam, resolve_gleam_symbols  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
@@ -1972,6 +1973,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".lua": "lua", ".luau": "lua",
     ".zig": "zig",
     ".ex": "elixir", ".exs": "elixir",
+    ".gleam": "gleam",
     ".jl": "julia",
     ".dart": "dart",
     ".sh": "shell", ".bash": "shell",
@@ -3582,6 +3584,9 @@ _KOTLIN_IMPORT_TARGET_RESOLVER = LanguageResolver(
 # by adding one register() call below — no edits to extract()'s body. Order
 # preserved from the prior inlined wiring: Swift (#1356) before Python (#1446).
 register_language_resolver(
+    LanguageResolver("gleam_symbols", frozenset({".gleam"}), resolve_gleam_symbols)
+)
+register_language_resolver(
     LanguageResolver("swift_member_calls", frozenset({".swift"}), _resolve_swift_member_calls)
 )
 register_language_resolver(
@@ -4692,6 +4697,7 @@ _DISPATCH: dict[str, Any] = {
     ".psd1": extract_powershell_manifest,
     ".ex": extract_elixir,
     ".exs": extract_elixir,
+    ".gleam": extract_gleam,
     ".m": extract_objc,
     ".mm": extract_objc,
     ".jl": extract_julia,
@@ -6074,7 +6080,9 @@ def extract(
     # JS/TS/JSX modules have no implicit cross-module scope: a call into another
     # file is real ONLY if the caller imported it. So a cross-file call from one
     # of these files with no import evidence is gated below (#1659).
-    _JS_TS_CALL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
+    _EXPLICIT_IMPORT_CALL_SUFFIXES = (
+        ".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs", ".gleam",
+    )
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -6229,7 +6237,10 @@ def extract(
         # legitimately call across files without an explicit import. Scoped to
         # direct calls: the indirect_call path above is already conservative
         # (INFERRED, callable-target-gated) and independent of import evidence.
-        if not has_import_evidence and str(rc.get("source_file", "")).endswith(_JS_TS_CALL_SUFFIXES):
+        if (
+            not has_import_evidence
+            and str(rc.get("source_file", "")).endswith(_EXPLICIT_IMPORT_CALL_SUFFIXES)
+        ):
             continue
         if tgt != caller and (caller, tgt) not in existing_pairs:
             existing_pairs.add((caller, tgt))
