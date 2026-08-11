@@ -58,7 +58,7 @@ That's it. You get **three files**:
 
 ```
 graphify-out/
-├── graph.html       open in any browser — click nodes, filter, search
+├── graph.html       open in any browser — click nodes, filter, search (`--viz 3d` for the WebGL 3D view)
 ├── GRAPH_REPORT.md  the highlights: key concepts, surprising connections, suggested questions
 └── graph.json       the full graph — query it anytime without re-reading your files
 ```
@@ -375,6 +375,7 @@ You can also set `GRAPHIFY_GOOGLE_WORKSPACE=1`. Graphify exports shortcuts into
 /graphify . --cluster-only --resolution 1.5      # more granular communities
 /graphify . --cluster-only --exclude-hubs 99     # suppress utility super-hubs from god-node rankings
 /graphify . --no-viz               # skip the HTML, just the report + JSON
+/graphify . --viz 3d               # render graph.html as a navigable WebGL 3D view
 /graphify . --wiki                 # build a markdown wiki from the graph
 graphify export callflow-html      # Mermaid architecture/call-flow HTML (auto-regenerates on every git commit if hook is installed)
 
@@ -395,6 +396,28 @@ graphify prs --conflicts           # PRs sharing graph communities — merge-ord
 ```
 
 See the [full command reference](#full-command-reference) below.
+
+### Offline 3D HTML export
+
+Use the opt-in WebGL renderer when a dense graph is easier to inspect in three
+dimensions:
+
+```bash
+graphify export html --viz 3d
+# or build and render in one step
+/graphify . --viz 3d
+```
+
+The generated `graphify-out/graph.html` embeds the graph data and the pinned
+3D rendering engine. It can be copied to another machine and opened without a
+server or network connection. Community names come from
+`.graphify_labels.json`; node colors identify communities and node size
+reflects degree (or member count in an aggregated view).
+
+The 2D renderer remains the default. Use `--viz 2d` explicitly when WebGL or
+hardware acceleration is unavailable. Graphs above the visualization node
+limit retain the existing safe behavior: Graphify exports a community-level
+aggregate instead of attempting an unbounded browser layout.
 
 ---
 
@@ -598,8 +621,9 @@ graphify extract . --mode deep --token-budget 4000                # smaller inpu
 ```
 With a cloud gateway like OpenRouter, prefer `--backend openai` (set `OPENAI_BASE_URL`) over the Ollama shim — it's a cleaner OpenAI-compatible path. If the model has its own max-output ceiling, lowering `--token-budget` is the reliable lever.
 
-**Graph HTML is too large to open in a browser (>5000 nodes)**
-Skip HTML generation and use the JSON directly:
+**Graph HTML has more than 5000 nodes**
+Graphify automatically exports a community-level aggregate at the default
+visualization limit. To skip HTML and query the full graph directly:
 ```bash
 graphify cluster-only ./my-project --no-viz
 graphify query "..."
