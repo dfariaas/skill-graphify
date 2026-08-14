@@ -1,7 +1,12 @@
 # Changelog
 
-Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
+Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.32 (unreleased)
+## 0.9.35 (unreleased)
+## 0.9.36 (unreleased)
+## 0.9.38 (unreleased)
+## 0.9.40 (unreleased)
 ## 0.9.42 (unreleased)
 
 - Fix: a JS/TS `for...of` / `for...in` loop binding is now shadowed, so passing it as a call argument no longer fabricates an `indirect_call` edge to an unrelated same-named callable (#2685, thanks @ousamabenyounes); completes the loop/closure/catch shadow family (#2568/#2569/#2517).
