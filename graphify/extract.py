@@ -48,6 +48,7 @@ from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.markdown import extract_markdown  # noqa: F401
 from graphify.extractors.ocaml import extract_ocaml  # noqa: F401
 from graphify.extractors.pascal_forms import extract_delphi_form, extract_lazarus_form  # noqa: F401
+from graphify.extractors.perl import _resolve_perl_imports, extract_perl  # noqa: F401
 from graphify.extractors.powershell import extract_powershell, extract_powershell_manifest  # noqa: F401
 from graphify.extractors.razor import extract_razor  # noqa: F401
 from graphify.extractors.rust import extract_rust  # noqa: F401
@@ -2125,6 +2126,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".lua": "lua", ".luau": "lua",
     ".zig": "zig",
     ".ex": "elixir", ".exs": "elixir",
+    ".pl": "perl", ".pm": "perl",
     ".jl": "julia",
     ".dart": "dart",
     ".sh": "shell", ".bash": "shell",
@@ -3857,6 +3859,33 @@ register_language_resolver(
 )
 
 
+def _resolve_perl_imports_pass(per_file, all_nodes, all_edges, paths) -> None:
+    """Re-point dangling in-corpus Perl ``imports`` edges onto the real package node.
+
+    Registered LAST so it runs after the shared cross-file call pass (which reads
+    the bare module-label ``use`` targets via ``_has_package_import_evidence``) and
+    after the member-call resolvers — the same position as its former inline call at
+    the tail of ``extract()``. Scoped by extractor PROVENANCE, not suffix: an
+    extensionless ``#!/usr/bin/perl`` script is dispatched to ``extract_perl`` by
+    shebang and must be re-pointed too, which is why it declares a custom
+    ``activate`` predicate (a shebang-only corpus has no ``.pl``/``.pm`` suffix) and
+    takes ``paths`` (``wants_paths``) to recompute that provenance set.
+    """
+    perl_sources = {str(p) for p in paths if _get_extractor(p) is extract_perl}
+    _resolve_perl_imports(all_nodes, all_edges, perl_sources)
+
+
+register_language_resolver(
+    LanguageResolver(
+        "perl_import_repoint",
+        frozenset({".pl", ".pm"}),
+        _resolve_perl_imports_pass,
+        activate=lambda paths: any(_get_extractor(p) is extract_perl for p in paths),
+        wants_paths=True,
+    )
+)
+
+
 # Inline markdown link: [text](target "optional title"). The negative lookbehind
 # excludes images (![alt](src)). The target stops at whitespace/closing paren so
 # an optional "title" after the URL is dropped; an optional <...> wrapper is too.
@@ -4905,6 +4934,8 @@ _DISPATCH: dict[str, Any] = {
     ".psd1": extract_powershell_manifest,
     ".ex": extract_elixir,
     ".exs": extract_elixir,
+    ".pl": extract_perl,
+    ".pm": extract_perl,
     ".m": extract_objc,
     ".mm": extract_objc,
     ".jl": extract_julia,
@@ -4993,7 +5024,7 @@ _DEP_LOAD_FAILED_MARKER = "failed to load"
 # routes them to the CODE path via _shebang_interpreter; _get_extractor must
 # honor the same signal or these files are classified as code and then silently
 # dropped by extraction. Only interpreters with a real extractor are mapped —
-# detect's wider set (perl, fish, tcsh, Rscript) stays unmapped and skipped.
+# detect's wider set (fish, tcsh, Rscript) stays unmapped and skipped.
 _SHEBANG_DISPATCH: dict[str, Any] = {
     "python": extract_python,
     "python2": extract_python,
@@ -5009,6 +5040,7 @@ _SHEBANG_DISPATCH: dict[str, Any] = {
     "lua": extract_lua,
     "php": extract_php,
     "julia": extract_julia,
+    "perl": extract_perl,
 }
 
 
@@ -6334,6 +6366,21 @@ def extract(
     # of these files with no import evidence is gated below (#1659).
     _JS_TS_CALL_SUFFIXES = (".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs")
     _go_module_cache: dict[Path, str | None] = {}
+
+    # Enclosing-package label per node id, for the package-aware call resolution
+    # below. Only consulted for raw_calls that carry package qualifiers (Perl):
+    # a sub's direct container is its package node, whose label IS the package
+    # name (e.g. "Acme::Widget"), so the `contains` edge target->source gives
+    # sub_id -> package label. Other languages never set the package fields, so
+    # this map is built but never read for them.
+    _label_by_nid = {n["id"]: n.get("label", "") for n in all_nodes}
+    pkg_label_by_nid: dict[str, str] = {}
+    pkg_nid_by_sub_nid: dict[str, str] = {}
+    for e in all_edges:
+        if e.get("relation") == "contains":
+            pkg_label_by_nid[e["target"]] = _label_by_nid.get(e["source"], "")
+            pkg_nid_by_sub_nid[e["target"]] = e["source"]
+
     for rc in all_raw_calls:
         callee = rc.get("callee", "")
         if not callee:
@@ -6428,6 +6475,62 @@ def extract(
                 candidate_id in imported_symbols
                 or (candidate_file_nid is not None and candidate_file_nid in imported_modules)
             )
+
+        def _has_package_import_evidence(candidate_id: str) -> bool:
+            # Perl-only: `use P::A;` emits an imports edge to the MODULE label id
+            # (`_make_id('P::A')`), never to the sub id — so a bare call to an
+            # imported package's sub has no direct symbol/module evidence above.
+            # Bridge it: the candidate sub's enclosing package, re-idized the same
+            # way the `use` target is, must be among the caller file's imports.
+            pkg = pkg_label_by_nid.get(candidate_id, "")
+            if not pkg:
+                return False
+            if _make_id(pkg) in imported_symbols:
+                return True
+            # Accept the real package-node id form too. The import re-pointer rewrites
+            # a `use` target from the bare module-label id onto the package node id;
+            # matching either shape means this evidence check no longer depends on
+            # whether that re-pointer has run yet — the pass ordering stops being
+            # semantically load-bearing (A3). The current order (re-pointer after this
+            # pass) is kept regardless.
+            pkg_nid = pkg_nid_by_sub_nid.get(candidate_id)
+            return pkg_nid is not None and pkg_nid in imported_symbols
+
+        # Package-aware pre-filter for Perl, which tags every call with its
+        # enclosing package. Gated on the extractor-stamped `lang` (matching the
+        # cpp/csharp/java/objc raw-call consumers) rather than field-presence, so
+        # the branch claims exactly Perl's raw_calls and another language that
+        # happened to set a `*_package` field could never fall into it. Zero-edge
+        # over a wrong guess: an unresolvable qualifier or a foreign-package bare
+        # call is dropped, not bound to a same-named sub in the wrong package.
+        callee_package = rc.get("callee_package")
+        caller_package = rc.get("caller_package")
+        if rc.get("lang") == "perl":
+            if callee_package is not None:
+                # Qualified call `Pkg::sub()`: bind only to a sub whose enclosing
+                # package matches the qualifier. None or several -> drop.
+                candidates = [
+                    c for c in candidates
+                    if pkg_label_by_nid.get(c) == callee_package
+                ]
+            else:
+                # Bare call: prefer the caller's own package. If the sub is
+                # defined there, that's the target. Otherwise it can only be an
+                # imported sub — require unique import evidence, else drop (never
+                # bind a same-named sub from an unrelated package).
+                same_pkg = [
+                    c for c in candidates
+                    if pkg_label_by_nid.get(c) == caller_package
+                ]
+                if same_pkg:
+                    candidates = same_pkg
+                else:
+                    candidates = [
+                        c for c in candidates
+                        if _has_import_evidence(c) or _has_package_import_evidence(c)
+                    ]
+            if len(candidates) != 1:
+                continue
 
         if len(candidates) == 1:
             tgt = candidates[0]
@@ -6532,6 +6635,9 @@ def extract(
     # receiver-typed/qualified calls the shared pass skipped) with its own
     # single-definition god-node guard. Registered in graphify.resolver_registry so
     # a new language plugs in without editing this body (#1356 Swift, #1446 Python).
+    # The Perl import re-pointer (`perl_import_repoint`) is the last registered
+    # resolver, so it runs here — after the call pass and member-call resolvers,
+    # before the relativization below — the same position as its former inline call.
     #
     # #2437: on an incremental rebuild the resolvers must also see the unchanged
     # corpus — its nodes (types/methods, from resolution_nodes above) and its

@@ -21,8 +21,9 @@ from graphify.paths import GRAPHIFY_OUT as _GRAPHIFY_OUT
 # AST cache entries are the output of graphify's own extractor code, so they
 # are only valid for the version that wrote them: keying purely on file
 # content means extractor fixes shipped in a new release keep serving stale
-# pre-fix results. The AST cache is therefore namespaced by package version
-# (cache/ast/v{version}/), with entries from other versions removed on first
+# pre-fix results. The AST cache is therefore namespaced by package version AND an
+# output-shape schema counter (cache/ast/v{version}-s{schema}/, see
+# _AST_SCHEMA_VERSION below), with entries from other namespaces removed on first
 # use. The semantic cache is deliberately NOT versioned — its entries are
 # produced by the LLM from file contents, and invalidating them on every
 # release would re-bill extraction for unchanged files.
@@ -32,6 +33,17 @@ try:
     _EXTRACTOR_VERSION = _pkg_version("graphifyy")
 except Exception:
     _EXTRACTOR_VERSION = "unknown"
+
+# Package version alone under-invalidates: an extractor OUTPUT-SHAPE change (a new
+# per-node/edge/raw_calls field, a differently-shaped node) can ship WITHIN a
+# release without a version bump, and a version-only namespace would keep serving
+# the pre-change entries. This integer rides alongside the version in the AST cache
+# dir name (``v{version}-s{schema}``); bump it whenever the AST extractor's emitted
+# shape changes without a release, so old entries relocate out of the served
+# namespace and are swept. Follows the integer schema-version pattern used by
+# reflect.py (_LEARNING_SCHEMA_VERSION) and diagnostics.py.
+#   schema 1: per-call ``lang`` stamp + lazy ``main`` package node (Perl S6c).
+_AST_SCHEMA_VERSION = 1
 
 # Version dirs already swept this process — cleanup runs once per (base, version).
 _cleaned_ast_dirs: set[str] = set()
@@ -844,11 +856,12 @@ def cache_dir(root: Path = Path("."), kind: str = "ast",
     "semantic-deep" (#1894). Separate subdirectories prevent semantic cache
     entries from overwriting AST cache entries for the same source_file (#582).
 
-    AST entries live in graphify-out/cache/ast/v{version}/ — namespaced by
-    graphify version because they depend on extractor code, not just file
-    contents. Semantic entries are still NOT version-namespaced (re-extraction
-    costs LLM calls, #1252): they live in graphify-out/cache/semantic/, with
-    deep-mode entries beside them in graphify-out/cache/semantic-deep/.
+    AST entries live in graphify-out/cache/ast/v{version}-s{schema}/ — namespaced
+    by graphify version AND output-shape schema (see _AST_SCHEMA_VERSION) because
+    they depend on extractor code, not just file contents. Semantic entries are
+    still NOT version-namespaced (re-extraction costs LLM calls, #1252): they
+    live in graphify-out/cache/semantic/, with deep-mode entries beside them in
+    graphify-out/cache/semantic-deep/.
 
     ``prompt_fp`` (semantic kinds only) adds a p{fingerprint}/ subdirectory so
     entries are attributed to the extraction prompt that produced them (#1939).
@@ -859,7 +872,7 @@ def cache_dir(root: Path = Path("."), kind: str = "ast",
     base = _out if _out.is_absolute() else Path(root).resolve() / _out
     d = base / "cache" / kind
     if kind == "ast":
-        d = d / f"v{_EXTRACTOR_VERSION}"
+        d = d / f"v{_EXTRACTOR_VERSION}-s{_AST_SCHEMA_VERSION}"
         _cleanup_stale_ast_entries(d.parent, d)
     elif prompt_fp:
         d = d / f"p{prompt_fp}"

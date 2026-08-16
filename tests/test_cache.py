@@ -1486,3 +1486,58 @@ def test_corrupt_semantic_entry_warns_and_is_a_miss(tmp_path):
     # The corrupt entry is a miss, so the file is re-dispatched for extraction.
     assert nodes == []
     assert uncached == [str(f)]
+
+
+def test_ast_cache_invalidated_on_schema_bump(tmp_path, monkeypatch):
+    """AST output SHAPE can change within a release (no version bump) — e.g. a new
+    per-call `lang` stamp or a lazily-materialized package node. Bumping
+    _AST_SCHEMA_VERSION must invalidate entries written under the prior schema even
+    when _EXTRACTOR_VERSION is unchanged (F1)."""
+    import graphify.cache as cache_mod
+
+    f = tmp_path / "mod.pl"
+    f.write_text("package Foo;\nsub run { helper(); }\n")
+
+    monkeypatch.setattr(cache_mod, "_AST_SCHEMA_VERSION", 1, raising=False)
+    save_cached(f, {"nodes": [{"id": "n1"}], "edges": [], "raw_calls": []},
+                root=tmp_path, kind="ast")
+    assert load_cached(f, root=tmp_path, kind="ast") is not None
+
+    monkeypatch.setattr(cache_mod, "_AST_SCHEMA_VERSION", 2, raising=False)
+    assert load_cached(f, root=tmp_path, kind="ast") is None, (
+        "an AST entry from a prior schema version must not be served after a bump"
+    )
+
+
+def test_ast_schema_version_in_cache_dir(tmp_path):
+    """The AST cache directory carries the schema counter alongside the package
+    version, so a shape change relocates the namespace (F1)."""
+    import graphify.cache as cache_mod
+
+    d = cache_dir(tmp_path, "ast")
+    assert d.name == f"v{cache_mod._EXTRACTOR_VERSION}-s{cache_mod._AST_SCHEMA_VERSION}", (
+        f"AST cache dir must namespace by version AND schema, got {d.name!r}"
+    )
+
+
+def test_pre_schema_ast_entries_not_served(tmp_path):
+    """An entry written by a base-commit graphify (version-only namespace
+    `v{version}/`, before the schema counter existed) is by definition from an
+    older extractor SHAPE and must not be served — the invalidation the schema
+    bump provides for changes that ship without a version bump (F1)."""
+    import json
+    from graphify.cache import file_hash, _GRAPHIFY_OUT, _EXTRACTOR_VERSION
+
+    f = tmp_path / "mod.pl"
+    f.write_text("package Foo;\nsub run { helper(); }\n")
+    h = file_hash(f, tmp_path)
+
+    # pre-schema layout: cache/ast/v{version}/{hash}.json (no `-s{schema}` suffix)
+    old_dir = tmp_path / _GRAPHIFY_OUT / "cache" / "ast" / f"v{_EXTRACTOR_VERSION}"
+    old_dir.mkdir(parents=True)
+    (old_dir / f"{h}.json").write_text(
+        json.dumps({"nodes": [{"id": "stale"}], "edges": [], "raw_calls": []}))
+
+    assert load_cached(f, root=tmp_path, kind="ast") is None, (
+        "a version-only (pre-schema) AST entry must not be served"
+    )
